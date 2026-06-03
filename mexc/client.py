@@ -15,12 +15,12 @@ MEXC_SECRET_KEY  = os.getenv("MEXC_SECRET_KEY")
 
 class MEXCSpotClient:
 
-    def __init__(self):
+    def _init_(self):
         self.base    = SPOT_BASE_URL
         self.api_key = MEXC_API_KEY
         self.secret  = MEXC_SECRET_KEY
 
-    def get_ticker(self, symbol):
+    def get_ticker(self, symbol: str):
         r = requests.get(
             f"{self.base}/api/v3/ticker/price",
             params={"symbol": symbol}
@@ -28,35 +28,25 @@ class MEXCSpotClient:
         return r.json()
 
     def get_klines(self, symbol: str, interval: str = "15m", limit: int = 100):
-    # MEXC interval mapping
-    interval_map = {
-        "1m": "1m", "5m": "5m", "15m": "15m",
-        "30m": "30m", "1h": "60m", "4h": "4h",
-        "1d": "1d"
-    }
-    mexc_interval = interval_map.get(interval, interval)
-    r = requests.get(
-        f"{self.base}/api/v3/klines",
-        params={"symbol": symbol, "interval": mexc_interval, "limit": limit}
-    )
-    data = r.json()
-    if isinstance(data, dict) and "code" in data:
-        # Try alternative interval format
-        alt_map = {"60m": "1h", "4h": "4h"}
-        alt = alt_map.get(mexc_interval, mexc_interval)
+        interval_map = {
+            "1m": "1m", "5m": "5m", "15m": "15m",
+            "30m": "30m", "1h": "60m", "4h": "4h", "1d": "1d"
+        }
+        mexc_interval = interval_map.get(interval, interval)
         r = requests.get(
             f"{self.base}/api/v3/klines",
-            params={"symbol": symbol, "interval": alt, "limit": limit}
+            params={"symbol": symbol, "interval": mexc_interval, "limit": limit}
         )
         data = r.json()
-    return data
+        if isinstance(data, dict):
+            r2 = requests.get(
+                f"{self.base}/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit}
+            )
+            data = r2.json()
+        return data
 
-    def get_orderbook(self, symbol, limit=50):
-        """
-        Fetches order book from MEXC.
-        Returns bids (buyers) and asks (sellers).
-        limit = how many price levels to fetch (max 100)
-        """
+    def get_orderbook(self, symbol: str, limit: int = 50):
         r = requests.get(
             f"{self.base}/api/v3/depth",
             params={"symbol": symbol, "limit": limit}
@@ -79,11 +69,11 @@ class MEXCSpotClient:
 
     def place_order(self, symbol, side, order_type, quantity, price=None):
         params = {
-            "symbol":     symbol,
-            "side":       side,
-            "type":       order_type,
-            "quantity":   quantity,
-            "timestamp":  int(time.time() * 1000)
+            "symbol":    symbol,
+            "side":      side,
+            "type":      order_type,
+            "quantity":  quantity,
+            "timestamp": int(time.time() * 1000)
         }
         if order_type == "LIMIT" and price:
             params["price"]       = price
@@ -102,19 +92,19 @@ class MEXCSpotClient:
 
 class MEXCFuturesClient:
 
-    def __init__(self):
+    def _init_(self):
         self.base    = FUTURES_BASE_URL
         self.api_key = MEXC_API_KEY
         self.secret  = MEXC_SECRET_KEY
 
-    def get_ticker(self, symbol):
+    def get_ticker(self, symbol: str):
         r = requests.get(
             f"{self.base}/api/v1/contract/ticker",
             params={"symbol": symbol}
         )
         return r.json()
 
-    def get_klines(self, symbol, interval="Min15", limit=100):
+    def get_klines(self, symbol: str, interval: str = "Min15", limit: int = 100):
         r = requests.get(
             f"{self.base}/api/v1/contract/kline/{symbol}",
             params={"interval": interval, "limit": limit}
@@ -122,12 +112,12 @@ class MEXCFuturesClient:
         return r.json()
 
     def get_account_assets(self):
-        ts       = str(int(time.time() * 1000))
-        sign_str = self.api_key + ts
-        sig      = hmac.new(
-            self.secret.encode(), sign_str.encode(), hashlib.sha256
+        ts      = str(int(time.time() * 1000))
+        sig_str = self.api_key + ts
+        sig     = hmac.new(
+            self.secret.encode(), sig_str.encode(), hashlib.sha256
         ).hexdigest()
-        headers  = {
+        headers = {
             "ApiKey":       self.api_key,
             "Request-Time": ts,
             "Signature":    sig
@@ -135,36 +125,5 @@ class MEXCFuturesClient:
         r = requests.get(
             f"{self.base}/api/v1/private/account/assets",
             headers=headers
-        )
-        return r.json()
-
-    def place_order(self, symbol, side, order_type, vol,
-                    price=None, leverage=10, open_type=1):
-        import json
-        payload = {
-            "symbol":   symbol,
-            "side":     side,
-            "openType": open_type,
-            "type":     order_type,
-            "vol":      vol,
-            "leverage": leverage
-        }
-        if order_type == 1 and price:
-            payload["price"] = price
-        body = json.dumps(payload)
-        ts   = str(int(time.time() * 1000))
-        sig  = hmac.new(
-            self.secret.encode(), (self.api_key + ts + body).encode(),
-            hashlib.sha256
-        ).hexdigest()
-        headers = {
-            "ApiKey":       self.api_key,
-            "Request-Time": ts,
-            "Signature":    sig,
-            "Content-Type": "application/json"
-        }
-        r = requests.post(
-            f"{self.base}/api/v1/private/order/submit",
-            headers=headers, data=body
         )
         return r.json()
