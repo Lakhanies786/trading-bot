@@ -32,7 +32,8 @@ def get_price(symbol: str):
         spot = get_spot()
         return spot.get_ticker(symbol)
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        return {"error": str(e), "details": traceback.format_exc()}
 
 @app.get("/account/spot")
 def get_spot_account():
