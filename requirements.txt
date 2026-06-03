@@ -3,8 +3,9 @@ uvicorn==0.29.0
 python-dotenv==1.0.1
 requests==2.31.0
 websockets==12.0
-pandas
-pandas-ta
+pandas==2.0.3
+pandas-ta==0.3.14b
 python-telegram-bot==21.3
 httpx==0.27.0
 cryptography==42.0.5
+numpy==1.24.4
