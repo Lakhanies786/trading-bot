@@ -1,9 +1,8 @@
 import asyncio
 from fastapi import FastAPI
 
-app = FastAPI(title="MEXC Trading Bot", version="2.0.0")
+app = FastAPI(title="MEXC Trading Bot", version="3.0.0")
 
-# ── lazy-load clients ──────────────────────────────────
 def get_spot():
     from mexc.client import MEXCSpotClient
     return MEXCSpotClient()
@@ -16,7 +15,7 @@ active_trades: dict = {}
 
 @app.get("/")
 def root():
-    return {"status": "Bot is running ✅", "version": "2.0.0 - Multi Timeframe"}
+    return {"status": "Bot is running ✅", "version": "3.0.0 - Order Book + Multi Timeframe"}
 
 @app.get("/health")
 def health():
@@ -52,23 +51,21 @@ def get_futures_account():
         return {"error": str(e)}
 
 
-# ══════════════════════════════════════════════════════
-# MULTI TIMEFRAME SIGNAL — checks 15m + 1h + 4h
-# ══════════════════════════════════════════════════════
 @app.get("/signal/{symbol}")
 def get_signal(symbol: str = "BTCUSDT"):
     try:
         from strategy.indicators import (
             prepare_dataframe, add_indicators, generate_signal
         )
+        from strategy.orderbook import analyze_orderbook
+
         spot = get_spot()
 
-        # ── Fetch all 3 timeframes ─────────────────────
+        # ── Fetch 3 timeframes ─────────────────────────
         klines_15m = spot.get_klines(symbol, interval="15m", limit=100)
         klines_1h  = spot.get_klines(symbol, interval="1h",  limit=100)
         klines_4h  = spot.get_klines(symbol, interval="4h",  limit=100)
 
-        # ── Generate signal for each timeframe ─────────
         df_15m = add_indicators(prepare_dataframe(klines_15m))
         df_1h  = add_indicators(prepare_dataframe(klines_1h))
         df_4h  = add_indicators(prepare_dataframe(klines_4h))
@@ -77,66 +74,102 @@ def get_signal(symbol: str = "BTCUSDT"):
         sig_1h  = generate_signal(df_1h)
         sig_4h  = generate_signal(df_4h)
 
-        # ── Multi Timeframe Agreement Logic ────────────
-        signals = [sig_15m["signal"], sig_1h["signal"], sig_4h["signal"]]
+        # ── Fetch Order Book ───────────────────────────
+        orderbook    = spot.get_orderbook(symbol, limit=50)
+        current_price = sig_1h["price"]
+        ob_analysis  = analyze_orderbook(orderbook, current_price)
+
+        # ── Multi Timeframe Agreement ──────────────────
+        signals    = [sig_15m["signal"], sig_1h["signal"], sig_4h["signal"]]
         buy_count  = signals.count("BUY")
         sell_count = signals.count("SELL")
 
-        # All 3 agree = STRONG signal
         if buy_count == 3:
-            final_signal = "BUY"
-            agreement    = "🔥 STRONG BUY — All 3 timeframes agree!"
+            mtf_signal     = "BUY"
+            mtf_agreement  = "🔥 All 3 timeframes agree BUY"
             mtf_confidence = "HIGH"
         elif sell_count == 3:
-            final_signal = "SELL"
-            agreement    = "🔥 STRONG SELL — All 3 timeframes agree!"
+            mtf_signal     = "SELL"
+            mtf_agreement  = "🔥 All 3 timeframes agree SELL"
             mtf_confidence = "HIGH"
-        # 2 out of 3 agree = MODERATE signal
         elif buy_count == 2:
-            final_signal = "BUY"
-            agreement    = "✅ BUY — 2 of 3 timeframes agree"
+            mtf_signal     = "BUY"
+            mtf_agreement  = "✅ 2 of 3 timeframes say BUY"
             mtf_confidence = "MEDIUM"
         elif sell_count == 2:
-            final_signal = "SELL"
-            agreement    = "✅ SELL — 2 of 3 timeframes agree"
+            mtf_signal     = "SELL"
+            mtf_agreement  = "✅ 2 of 3 timeframes say SELL"
             mtf_confidence = "MEDIUM"
-        # No agreement = HOLD
         else:
-            final_signal = "HOLD"
-            agreement    = "⏳ HOLD — Timeframes disagree"
+            mtf_signal     = "HOLD"
+            mtf_agreement  = "⏳ Timeframes disagree"
             mtf_confidence = "LOW"
 
-        # ── Use the 1h signal as the main data source ──
+        # ── Combine MTF + Order Book ───────────────────
+        # Both agree = STRONG CONFIRMED signal
+        # They disagree = downgrade to HOLD
+        ob_signal = ob_analysis["ob_signal"]
+
+        if mtf_signal == "BUY" and ob_signal == "BUY":
+            final_signal   = "BUY"
+            final_strength = "🔥 STRONG BUY — Indicators + Order Book confirm!"
+        elif mtf_signal == "SELL" and ob_signal == "SELL":
+            final_signal   = "SELL"
+            final_strength = "🔥 STRONG SELL — Indicators + Order Book confirm!"
+        elif mtf_signal in ("BUY", "SELL") and ob_signal == "NEUTRAL":
+            final_signal   = mtf_signal
+            final_strength = f"✅ {mtf_signal} — Indicators agree, Order Book neutral"
+        elif mtf_signal == "HOLD":
+            final_signal   = "HOLD"
+            final_strength = "⏳ HOLD — No clear direction"
+        else:
+            # MTF says BUY but OB says SELL or vice versa = conflict
+            final_signal   = "HOLD"
+            final_strength = "⚠️ HOLD — Indicators conflict with Order Book"
+
         main = sig_1h
+        all_reasons = (
+            [final_strength, mtf_agreement]
+            + ob_analysis["ob_reasons"]
+            + main["reasons"]
+        )
 
         return {
-            "symbol":          symbol,
-            "signal":          final_signal,
-            "mtf_confidence":  mtf_confidence,
-            "agreement":       agreement,
+            "symbol":             symbol,
+            "signal":             final_signal,
+            "mtf_confidence":     mtf_confidence,
+            "agreement":          final_strength,
             "timeframes": {
                 "15m": sig_15m["signal"],
                 "1h":  sig_1h["signal"],
                 "4h":  sig_4h["signal"],
             },
-            "confidence":    main["confidence"],
-            "price":         main["price"],
-            "rsi":           main["rsi"],
-            "macd_hist":     main["macd_hist"],
-            "ema9":          main["ema9"],
-            "ema21":         main["ema21"],
-            "ema50":         main["ema50"],
-            "bb_lower":      main["bb_lower"],
-            "bb_upper":      main["bb_upper"],
-            "atr":           main["atr"],
-            "adx":           main["adx"],
-            "high_volume":   main["high_volume"],
-            "strong_trend":  main["strong_trend"],
-            "stop_loss":     main["stop_loss"],
-            "take_profit":   main["take_profit"],
-            "position_size": main["position_size"],
-            "risk_reward":   main["risk_reward"],
-            "reasons":       [agreement] + main["reasons"],
+            # Order Book data
+            "ob_signal":          ob_signal,
+            "bid_ask_ratio":      ob_analysis["bid_ask_ratio"],
+            "total_bid_volume":   ob_analysis["total_bid_volume"],
+            "total_ask_volume":   ob_analysis["total_ask_volume"],
+            "biggest_buy_wall":   ob_analysis["biggest_buy_wall"],
+            "biggest_sell_wall":  ob_analysis["biggest_sell_wall"],
+            "buy_wall_price":     ob_analysis["buy_wall_price"],
+            "sell_wall_price":    ob_analysis["sell_wall_price"],
+            # Indicators
+            "confidence":         main["confidence"],
+            "price":              main["price"],
+            "rsi":                main["rsi"],
+            "macd_hist":          main["macd_hist"],
+            "ema9":               main["ema9"],
+            "ema21":              main["ema21"],
+            "ema50":              main["ema50"],
+            "bb_lower":           main["bb_lower"],
+            "bb_upper":           main["bb_upper"],
+            "atr":                main["atr"],
+            "adx":                main["adx"],
+            "stop_loss":          main["stop_loss"],
+            "take_profit":        main["take_profit"],
+            "position_size":      main["position_size"],
+            "risk_reward":        main["risk_reward"],
+            "reasons":            all_reasons,
         }
 
     except Exception as e:

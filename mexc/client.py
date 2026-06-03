@@ -34,6 +34,18 @@ class MEXCSpotClient:
         )
         return r.json()
 
+    def get_orderbook(self, symbol, limit=50):
+        """
+        Fetches order book from MEXC.
+        Returns bids (buyers) and asks (sellers).
+        limit = how many price levels to fetch (max 100)
+        """
+        r = requests.get(
+            f"{self.base}/api/v3/depth",
+            params={"symbol": symbol, "limit": limit}
+        )
+        return r.json()
+
     def get_account(self):
         params = {"timestamp": int(time.time() * 1000)}
         query  = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
