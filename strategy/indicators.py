@@ -1,5 +1,5 @@
 import pandas as pd
-import ta
+import pandas_ta as ta 
 
 def prepare_dataframe(klines: list) -> pd.DataFrame:
     if len(klines[0]) == 8:
