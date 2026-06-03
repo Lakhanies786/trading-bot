@@ -27,12 +27,29 @@ class MEXCSpotClient:
         )
         return r.json()
 
-    def get_klines(self, symbol, interval="15m", limit=100):
+    def get_klines(self, symbol: str, interval: str = "15m", limit: int = 100):
+    # MEXC interval mapping
+    interval_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "30m": "30m", "1h": "60m", "4h": "4h",
+        "1d": "1d"
+    }
+    mexc_interval = interval_map.get(interval, interval)
+    r = requests.get(
+        f"{self.base}/api/v3/klines",
+        params={"symbol": symbol, "interval": mexc_interval, "limit": limit}
+    )
+    data = r.json()
+    if isinstance(data, dict) and "code" in data:
+        # Try alternative interval format
+        alt_map = {"60m": "1h", "4h": "4h"}
+        alt = alt_map.get(mexc_interval, mexc_interval)
         r = requests.get(
             f"{self.base}/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit}
+            params={"symbol": symbol, "interval": alt, "limit": limit}
         )
-        return r.json()
+        data = r.json()
+    return data
 
     def get_orderbook(self, symbol, limit=50):
         """
