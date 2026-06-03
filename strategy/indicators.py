@@ -1,8 +1,21 @@
 import pandas as pd
 import ta
 
-def prepare_dataframe(klines: list) -> pd.DataFrame:
-    if len(klines[0]) == 8:
+def prepare_dataframe(klines) -> pd.DataFrame:
+    # Handle if klines is a dict (MEXC sometimes returns dict)
+    if isinstance(klines, dict):
+        klines = klines.get("data", klines.get("result", []))
+    if not klines or len(klines) == 0:
+        raise ValueError("No kline data returned")
+    first = klines[0]
+    if isinstance(first, dict):
+        # Dict format
+        df = pd.DataFrame(klines)
+        df = df.rename(columns={
+            "t": "time", "o": "open", "h": "high",
+            "l": "low", "c": "close", "v": "volume"
+        })
+    elif len(first) == 8:
         df = pd.DataFrame(klines, columns=[
             "time", "open", "high", "low",
             "close", "volume", "close_time", "quote_volume"
@@ -14,9 +27,11 @@ def prepare_dataframe(klines: list) -> pd.DataFrame:
             "taker_buy_base", "taker_buy_quote", "ignore"
         ])
     for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df.set_index("time", inplace=True)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df.set_index("time", inplace=True)
     return df
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
