@@ -1,5 +1,5 @@
 import pandas as pd
-import pandas_ta as ta
+import ta
 
 def prepare_dataframe(klines: list) -> pd.DataFrame:
     if len(klines[0]) == 8:
@@ -21,36 +21,34 @@ def prepare_dataframe(klines: list) -> pd.DataFrame:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # EMA
-    df["ema9"]  = ta.ema(df["close"], length=9)
-    df["ema21"] = ta.ema(df["close"], length=21)
-    df["ema50"] = ta.ema(df["close"], length=50)
+    df["ema9"]  = ta.trend.ema_indicator(df["close"], window=9)
+    df["ema21"] = ta.trend.ema_indicator(df["close"], window=21)
+    df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
 
     # RSI
-    df["rsi"] = ta.rsi(df["close"], length=14)
+    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
 
     # MACD
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    df["macd"]        = macd["MACD_12_26_9"]
-    df["macd_signal"] = macd["MACDs_12_26_9"]
-    df["macd_hist"]   = macd["MACDh_12_26_9"]
+    macd = ta.trend.MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["macd"]        = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_hist"]   = macd.macd_diff()
 
     # Bollinger Bands
-    bb = ta.bbands(df["close"], length=20, std=2)
-    bb_upper_col = [c for c in bb.columns if c.startswith("BBU")][0]
-    bb_mid_col   = [c for c in bb.columns if c.startswith("BBM")][0]
-    bb_lower_col = [c for c in bb.columns if c.startswith("BBL")][0]
-    df["bb_upper"] = bb[bb_upper_col]
-    df["bb_mid"]   = bb[bb_mid_col]
-    df["bb_lower"] = bb[bb_lower_col]
+    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_mid"]   = bb.bollinger_mavg()
+    df["bb_lower"] = bb.bollinger_lband()
 
     # ATR
-    atr = ta.atr(df["high"], df["low"], df["close"], length=14)
-    df["atr"] = atr
+    df["atr"] = ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=14
+    )
 
     # ADX
-    adx = ta.adx(df["high"], df["low"], df["close"], length=14)
-    adx_col = [c for c in adx.columns if c.startswith("ADX")][0]
-    df["adx"] = adx[adx_col]
+    df["adx"] = ta.trend.adx(
+        df["high"], df["low"], df["close"], window=14
+    )
 
     return df
 
@@ -84,23 +82,21 @@ def generate_signal(df: pd.DataFrame) -> dict:
 
     if buy_conditions >= 3:
         signal = "BUY"
-        if ema_cross_up:   reasons.append("EMA 9 crossed above EMA 21")
-        if rsi_ok_buy:     reasons.append(f"RSI {last['rsi']:.1f} in healthy range")
-        if macd_bullish:   reasons.append("MACD bullish")
-        if near_lower:     reasons.append("Price at/below BB midline")
+        if ema_cross_up: reasons.append("EMA 9 crossed above EMA 21")
+        if rsi_ok_buy:   reasons.append(f"RSI {last['rsi']:.1f} healthy")
+        if macd_bullish: reasons.append("MACD bullish")
+        if near_lower:   reasons.append("Price at BB midline")
     elif sell_conditions >= 3:
         signal = "SELL"
         if ema_cross_down: reasons.append("EMA 9 crossed below EMA 21")
         if rsi_ok_sell:    reasons.append(f"RSI {last['rsi']:.1f}")
         if macd_bearish:   reasons.append("MACD bearish")
-        if near_upper:     reasons.append("Price at/above BB midline")
+        if near_upper:     reasons.append("Price above BB midline")
 
-    # Confidence score
-    met = buy_conditions if signal == "BUY" else sell_conditions
+    met        = buy_conditions if signal == "BUY" else sell_conditions
     confidence = f"{int((met/4)*100)}%"
 
-    # Risk management
-    atr_val  = float(last["atr"]) if pd.notna(last["atr"]) else price * 0.01
+    atr_val = float(last["atr"]) if pd.notna(last["atr"]) else price * 0.01
     if signal == "BUY":
         stop_loss   = round(price - (atr_val * 1.5), 2)
         take_profit = round(price + (atr_val * 3.0), 2)
@@ -116,21 +112,21 @@ def generate_signal(df: pd.DataFrame) -> dict:
     risk_reward = f"1:{round(reward/risk, 1)}" if risk > 0 else "1:2"
 
     return {
-        "signal":        signal,
-        "confidence":    confidence,
-        "price":         round(price, 4),
-        "rsi":           round(float(last["rsi"]), 2),
-        "macd_hist":     round(float(last["macd_hist"]), 6),
-        "ema9":          round(float(last["ema9"]), 4),
-        "ema21":         round(float(last["ema21"]), 4),
-        "ema50":         round(float(last["ema50"]), 4),
-        "bb_lower":      round(float(last["bb_lower"]), 4),
-        "bb_upper":      round(float(last["bb_upper"]), 4),
-        "atr":           round(float(atr_val), 4),
-        "adx":           round(float(last["adx"]), 2) if pd.notna(last["adx"]) else 0,
-        "stop_loss":     stop_loss,
-        "take_profit":   take_profit,
+        "signal":      signal,
+        "confidence":  confidence,
+        "price":       round(price, 4),
+        "rsi":         round(float(last["rsi"]), 2),
+        "macd_hist":   round(float(last["macd_hist"]), 6),
+        "ema9":        round(float(last["ema9"]), 4),
+        "ema21":       round(float(last["ema21"]), 4),
+        "ema50":       round(float(last["ema50"]), 4),
+        "bb_lower":    round(float(last["bb_lower"]), 4),
+        "bb_upper":    round(float(last["bb_upper"]), 4),
+        "atr":         round(float(atr_val), 4),
+        "adx":         round(float(last["adx"]), 2) if pd.notna(last["adx"]) else 0,
+        "stop_loss":   stop_loss,
+        "take_profit": take_profit,
         "position_size": round(1000 * 0.015 / risk, 4) if risk > 0 else 0,
-        "risk_reward":   risk_reward,
-        "reasons":       reasons
+        "risk_reward": risk_reward,
+        "reasons":     reasons
     }
