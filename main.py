@@ -1,4 +1,5 @@
 import asyncio
+import os
 from fastapi import FastAPI
 
 app = FastAPI(title="MEXC Trading Bot", version="4.0.0")
@@ -131,7 +132,27 @@ def get_signal(symbol: str = "BTCUSDT"):
             "risk_reward":       main["risk_reward"],
             "reasons":           all_reasons,
         }
-
+# Telegram alert for BUY/SELL
+        if final_signal in ("BUY", "SELL"):
+            try:
+                import requests as req
+                token = os.getenv("TELEGRAM_BOT_TOKEN")
+                chat_id = os.getenv("TELEGRAM_CHAT_ID")
+                msg = (
+                    f"SIGNAL {final_signal} - {symbol}\n"
+                    f"Price: {main['price']}\n"
+                    f"RSI: {main['rsi']}\n"
+                    f"SL: {main['stop_loss']} TP: {main['take_profit']}\n"
+                    f"RR: {main['risk_reward']}\n"
+                    f"{final_strength}"
+                )
+                req.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": msg},
+                    timeout=5
+                )
+            except:
+                pass
     except Exception as e:
         import traceback
         return {"error": repr(e), "trace": traceback.format_exc()}
