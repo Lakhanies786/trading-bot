@@ -15,7 +15,7 @@ MEXC_SECRET_KEY  = os.getenv("MEXC_SECRET_KEY")
 
 class MEXCSpotClient:
 
-    def _init_(self):
+    def __init__(self):
         self.base    = SPOT_BASE_URL
         self.api_key = MEXC_API_KEY
         self.secret  = MEXC_SECRET_KEY
@@ -92,7 +92,7 @@ class MEXCSpotClient:
 
 class MEXCFuturesClient:
 
-    def _init_(self):
+    def __init__(self):
         self.base    = FUTURES_BASE_URL
         self.api_key = MEXC_API_KEY
         self.secret  = MEXC_SECRET_KEY
