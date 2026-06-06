@@ -199,3 +199,57 @@ def stop_monitor(symbol: str):
         del active_trades[symbol]
         return {"status": f"Stopped monitoring {symbol} ✅"}
     return {"status": "Trade not found"}
+
+    # Auto trader
+from strategy.auto_trader import auto_trader
+
+@app.get("/auto/scan")
+def auto_scan():
+    """Scan all pairs and auto-trade if signal found"""
+    try:
+        auto_trader.scan_and_trade()
+        return {
+            "status": "Scan complete",
+            "open_trades": len(auto_trader.open_trades),
+            "trades": auto_trader.open_trades,
+            "history": auto_trader.trade_history[-5:]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/auto/status")
+def auto_status():
+    """Check current open trades"""
+    return {
+        "open_trades":   auto_trader.open_trades,
+        "total_closed":  len(auto_trader.trade_history),
+        "history":       auto_trader.trade_history[-10:]
+    }
+
+@app.get("/auto/enable")
+def enable_auto():
+    """Enable auto trading mode"""
+    return {"status": "Auto trading active ✅", "pairs": PAIRS}
+
+@app.get("/scan/all")
+def scan_all_pairs():
+    """Get signals for all pairs without trading"""
+    results = []
+    for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]:
+        try:
+            from strategy.indicators import prepare_dataframe, add_indicators, generate_signal
+            spot   = get_spot()
+            klines = spot.get_klines(symbol, interval="15m", limit=200)
+            df     = add_indicators(prepare_dataframe(klines))
+            sig    = generate_signal(df)
+            results.append({
+                "symbol":     symbol,
+                "signal":     sig["signal"],
+                "confidence": sig["confidence"],
+                "score":      sig["score"],
+                "rsi":        sig["rsi"],
+                "price":      sig["price"]
+            })
+        except Exception as e:
+            results.append({"symbol": symbol, "error": str(e)})
+    return {"pairs": results}
