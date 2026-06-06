@@ -10,8 +10,8 @@ PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 ACCOUNT_BALANCE   = 1000   # Update this to your real balance
 RISK_PER_TRADE    = 0.015  # 1.5% per trade
 MAX_OPEN_TRADES   = 3      # Max simultaneous trades
-MIN_CONFIDENCE    = 60     # Minimum confidence % to take trade
-MIN_SCORE         = 7      # Minimum score out of 12
+MIN_CONFIDENCE    = 70     # Minimum confidence % to take trade (raised from 60)
+MIN_SCORE         = 8      # Minimum score out of 12 (raised from 7)
 
 def send_telegram(message: str):
     token   = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -70,12 +70,17 @@ class AutoTrader:
     def place_order(self, symbol: str, sig: dict) -> bool:
         try:
             from mexc.client import MEXCSpotClient
-            spot     = MEXCSpotClient()
-            price    = sig["price"]
-            side     = sig["signal"]  # BUY or SELL
-            sl       = sig["stop_loss"]
-            tp       = sig["take_profit"]
-            qty      = sig["position_size"]
+            spot  = MEXCSpotClient()
+            price = sig["price"]
+            side  = sig["signal"]  # BUY or SELL
+            sl    = sig["stop_loss"]
+            tp    = sig["take_profit"]
+            qty   = sig["position_size"]
+
+            # Safety guard — never place order if levels are missing
+            if sl is None or tp is None or qty == 0:
+                print(f"⚠️ Skipping {symbol} — SL/TP/qty missing")
+                return False
 
             # Place market order
             order = spot.place_order(

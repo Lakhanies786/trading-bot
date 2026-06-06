@@ -101,7 +101,7 @@ def generate_signal(df: pd.DataFrame) -> dict:
     # ── RSI ───────────────────────────────────────
     rsi = float(last["rsi"])
     rsi_buy  = 35 < rsi < 65
-    rsi_sell = 35 < rsi < 65
+    rsi_sell = rsi > 55  # Sell favored when RSI is elevated
     rsi_oversold  = rsi < 35
     rsi_overbought = rsi > 65
 
@@ -225,16 +225,20 @@ def generate_signal(df: pd.DataFrame) -> dict:
     elif signal == "SELL":
         stop_loss   = round(price + (atr_val * 1.5), 2)
         take_profit = round(price - (atr_val * 3.0), 2)
+    else:  # HOLD — no trade, no levels needed
+        stop_loss   = None
+        take_profit = None
+
+    if stop_loss is not None and take_profit is not None:
+        risk          = abs(price - stop_loss)
+        reward        = abs(take_profit - price)
+        risk_reward   = f"1:{round(reward/risk, 1)}" if risk > 0 else "1:2"
+        position_size = round(1000 * 0.015 / risk, 4) if risk > 0 else 0
     else:
-        stop_loss   = round(price - (atr_val * 1.5), 2)
-        take_profit = round(price + (atr_val * 3.0), 2)
-
-    risk        = abs(price - stop_loss)
-    reward      = abs(take_profit - price)
-    risk_reward = f"1:{round(reward/risk, 1)}" if risk > 0 else "1:2"
-
-    # Position size (1.5% risk of $1000 account)
-    position_size = round(1000 * 0.015 / risk, 4) if risk > 0 else 0
+        risk          = 0
+        reward        = 0
+        risk_reward   = "N/A"
+        position_size = 0
 
     return {
         "signal":        signal,
