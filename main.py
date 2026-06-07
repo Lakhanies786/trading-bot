@@ -3,7 +3,7 @@ import os
 import time
 from fastapi import FastAPI
 
-app = FastAPI(title="MEXC Trading Bot", version="5.0.0")
+app = FastAPI(title="MEXC Trading Bot", version="6.0.0")
 
 def get_spot():
     from mexc.client import MEXCSpotClient
@@ -11,19 +11,17 @@ def get_spot():
 
 active_trades: dict = {}
 
-# ── Signal cooldown state (Fix 3: stop signal flipping) ──
-# Stores: { symbol: { "signal": "BUY", "confirmed_at": timestamp, "count": 3 } }
+# ── Signal cooldown state ──────────────────────────────────────────────
 _signal_state: dict = {}
-CONFIRM_COUNT   = 3      # signal must appear 3 times in a row to confirm
-COOLDOWN_SECS   = 900    # once confirmed, hold for 15 minutes minimum
+CONFIRM_COUNT  = 3
+COOLDOWN_SECS  = 900
 
-# ── Last Telegram alert tracker (avoid spam) ──
-_last_alert: dict = {}   # { symbol: { "signal": "BUY", "sent_at": timestamp } }
-ALERT_COOLDOWN  = 900    # don't resend same signal for 15 minutes
+# ── Telegram alert dedup ───────────────────────────────────────────────
+_last_alert: dict = {}
+ALERT_COOLDOWN = 900
 
 
 def send_telegram(msg: str):
-    """Send a Telegram message."""
     try:
         import requests as req
         token   = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -39,71 +37,47 @@ def send_telegram(msg: str):
         pass
 
 
-def maybe_send_alert(symbol: str, signal: str, price: float,
-                     sl: float, tp: float, rr: str, strength: str):
-    """Send Telegram only if signal changed or cooldown expired."""
+def maybe_send_alert(symbol, signal, price, sl, tp, rr, strength):
     now  = time.time()
     last = _last_alert.get(symbol, {})
-
-    same_signal   = last.get("signal") == signal
-    within_window = (now - last.get("sent_at", 0)) < ALERT_COOLDOWN
-
-    if same_signal and within_window:
-        return  # already alerted recently for this signal
-
+    if last.get("signal") == signal and (now - last.get("sent_at", 0)) < ALERT_COOLDOWN:
+        return
     _last_alert[symbol] = {"signal": signal, "sent_at": now}
     send_telegram(
         f"SIGNAL {signal} - {symbol}\n"
-        f"Price: {price}\n"
-        f"SL: {sl}  TP: {tp}\n"
-        f"RR: {rr}\n"
-        f"{strength}"
+        f"Price: {price}\nSL: {sl}  TP: {tp}\nRR: {rr}\n{strength}"
     )
 
 
 def stabilize_signal(symbol: str, raw_signal: str) -> str:
-    """
-    Fix 3 — Signal stability filter.
-    Only confirm a signal after it appears CONFIRM_COUNT times in a row.
-    Once confirmed hold it for COOLDOWN_SECS even if it flips.
-    """
     now   = time.time()
-    state = _signal_state.get(symbol, {"signal": "HOLD", "confirmed_at": 0, "count": 0, "candidate": "HOLD"})
-
-    # Still within cooldown of confirmed signal — don't change
+    state = _signal_state.get(symbol, {
+        "signal": "HOLD", "confirmed_at": 0, "count": 0, "candidate": "HOLD"
+    })
     if state["signal"] != "HOLD" and (now - state["confirmed_at"]) < COOLDOWN_SECS:
         return state["signal"]
-
-    # Count consecutive same raw signals
     if raw_signal == state.get("candidate"):
         state["count"] += 1
     else:
         state["candidate"] = raw_signal
         state["count"]     = 1
-
-    # Confirm only after CONFIRM_COUNT consecutive
     if state["count"] >= CONFIRM_COUNT:
         state["signal"]       = raw_signal
         state["confirmed_at"] = now
         state["count"]        = 0
-
     _signal_state[symbol] = state
     return state["signal"]
 
 
 def compute_signal(symbol: str) -> dict:
-    """
-    Core signal computation — used by both /signal endpoint and background scanner.
-    Fix 1: SL/TP now always computed from final_signal, not just 1h.
-    """
     from strategy.indicators import prepare_dataframe, add_indicators, generate_signal
     from strategy.orderbook  import analyze_orderbook
 
     spot = get_spot()
 
-    klines_15m = spot.get_klines(symbol, interval="15m", limit=100)
-    klines_1h  = spot.get_klines(symbol, interval="1h",  limit=100)
-    klines_4h  = spot.get_klines(symbol, interval="4h",  limit=100)
+    klines_15m = spot.get_klines(symbol, interval="15m", limit=200)
+    klines_1h  = spot.get_klines(symbol, interval="1h",  limit=200)
+    klines_4h  = spot.get_klines(symbol, interval="4h",  limit=200)
 
     df_15m = add_indicators(prepare_dataframe(klines_15m))
     df_1h  = add_indicators(prepare_dataframe(klines_1h))
@@ -135,34 +109,31 @@ def compute_signal(symbol: str) -> dict:
         mtf_agreement  = "⏳ Timeframes disagree — wait"
 
     if raw_signal == ob_signal and raw_signal != "HOLD":
-        raw_signal    = raw_signal
         final_strength = f"🔥 STRONG {raw_signal} — Indicators + Order Book confirm!"
     elif raw_signal in ("BUY", "SELL"):
         final_strength = f"✅ {raw_signal} — Indicators agree"
     else:
         final_strength = "⏳ HOLD — No clear direction"
 
-    # Fix 3: stabilize before using
     final_signal = stabilize_signal(symbol, raw_signal)
     if final_signal != raw_signal:
-        final_strength = f"⏳ HOLD — Waiting for signal to confirm ({raw_signal} pending)"
+        final_strength = f"⏳ HOLD — Waiting to confirm ({raw_signal} pending)"
 
-    # Fix 1: SL/TP from final_signal direction, using 1h ATR for levels
     main    = sig_1h
     price   = main["price"]
     atr_val = main["atr"]
 
     if final_signal == "BUY":
-        stop_loss   = round(price - (atr_val * 1.5), 2)   # BELOW entry ✅
-        take_profit = round(price + (atr_val * 3.0), 2)   # ABOVE entry ✅
+        stop_loss   = round(price - (atr_val * 1.5), 4)
+        take_profit = round(price + (atr_val * 3.0), 4)
     elif final_signal == "SELL":
-        stop_loss   = round(price + (atr_val * 1.5), 2)   # ABOVE entry ✅
-        take_profit = round(price - (atr_val * 3.0), 2)   # BELOW entry ✅
+        stop_loss   = round(price + (atr_val * 1.5), 4)
+        take_profit = round(price - (atr_val * 3.0), 4)
     else:
         stop_loss   = None
         take_profit = None
 
-    if stop_loss is not None and take_profit is not None:
+    if stop_loss and take_profit:
         risk        = abs(price - stop_loss)
         reward      = abs(take_profit - price)
         risk_reward = f"1:{round(reward/risk, 1)}" if risk > 0 else "1:2"
@@ -171,65 +142,74 @@ def compute_signal(symbol: str) -> dict:
 
     all_reasons = [final_strength, mtf_agreement] + ob_analysis["ob_reasons"] + main["reasons"]
 
-    # Fix 2: Telegram alert with dedup
     if final_signal in ("BUY", "SELL") and stop_loss and take_profit:
         maybe_send_alert(symbol, final_signal, price, stop_loss, take_profit, risk_reward, final_strength)
 
     return {
-        "symbol":            symbol,
-        "signal":            final_signal,
-        "confidence":        main.get("confidence", "0%"),
-        "mtf_confidence":    mtf_confidence,
-        "agreement":         final_strength,
+        "symbol":              symbol,
+        "signal":              final_signal,
+        "confidence":          main.get("confidence", "0%"),
+        "mtf_confidence":      mtf_confidence,
+        "agreement":           final_strength,
         "timeframes": {
             "15m": sig_15m["signal"],
             "1h":  sig_1h["signal"],
             "4h":  sig_4h["signal"],
         },
-        "ob_signal":         ob_signal,
-        "bid_ask_ratio":     ob_analysis["bid_ask_ratio"],
-        "total_bid_volume":  ob_analysis["total_bid_volume"],
-        "total_ask_volume":  ob_analysis["total_ask_volume"],
-        "biggest_buy_wall":  ob_analysis["biggest_buy_wall"],
-        "biggest_sell_wall": ob_analysis["biggest_sell_wall"],
-        "buy_wall_price":    ob_analysis["buy_wall_price"],
-        "sell_wall_price":   ob_analysis["sell_wall_price"],
-        "price":             price,
-        "rsi":               main["rsi"],
-        "macd_hist":         main["macd_hist"],
-        "ema9":              main["ema9"],
-        "ema21":             main["ema21"],
-        "ema50":             main["ema50"],
-        "bb_lower":          main["bb_lower"],
-        "bb_upper":          main["bb_upper"],
-        "atr":               main["atr"],
-        "adx":               main["adx"],
-        "stop_loss":         stop_loss,
-        "take_profit":       take_profit,
-        "position_size":     main["position_size"],
-        "risk_reward":       risk_reward,
-        "score":             main.get("score"),
-        "vwap":              main.get("vwap"),
-        "vol_ratio":         main.get("vol_ratio"),
-        "stoch_k":           main.get("stoch_k"),
-        "reasons":           all_reasons,
+        "ob_signal":           ob_signal,
+        "bid_ask_ratio":       ob_analysis["bid_ask_ratio"],
+        "ob_imbalance":        ob_analysis.get("imbalance", 0),      # NEW
+        "ob_liquidity":        ob_analysis.get("liquidity", 0),      # NEW
+        "ob_spread_pct":       ob_analysis.get("spread_pct", 0),     # NEW
+        "total_bid_volume":    ob_analysis["total_bid_volume"],
+        "total_ask_volume":    ob_analysis["total_ask_volume"],
+        "biggest_buy_wall":    ob_analysis["biggest_buy_wall"],
+        "biggest_sell_wall":   ob_analysis["biggest_sell_wall"],
+        "buy_wall_price":      ob_analysis["buy_wall_price"],
+        "sell_wall_price":     ob_analysis["sell_wall_price"],
+        "price":               price,
+        "rsi":                 main["rsi"],
+        "macd_hist":           main["macd_hist"],
+        "ema9":                main["ema9"],
+        "ema21":               main["ema21"],
+        "ema50":               main["ema50"],
+        "adx":                 main["adx"],
+        "adx_pos":             main.get("adx_pos", 0),               # NEW
+        "adx_neg":             main.get("adx_neg", 0),               # NEW
+        "cvd":                 main.get("cvd", 0),                   # NEW
+        "roc":                 main.get("roc", 0),                   # NEW
+        "bb_lower":            main["bb_lower"],
+        "bb_upper":            main["bb_upper"],
+        "atr":                 main["atr"],
+        "stop_loss":           stop_loss,
+        "take_profit":         take_profit,
+        "position_size":       main["position_size"],
+        "risk_reward":         risk_reward,
+        "score":               main.get("score"),
+        "vwap":                main.get("vwap"),
+        "vol_ratio":           main.get("vol_ratio"),
+        "stoch_k":             main.get("stoch_k"),
+        "nearest_support":     main.get("nearest_support"),          # NEW
+        "nearest_resistance":  main.get("nearest_resistance"),       # NEW
+        "fib_618":             main.get("fib_618"),                  # NEW
+        "fib_382":             main.get("fib_382"),                  # NEW
+        "reasons":             all_reasons,
     }
 
 
-# ── Fix 2: Background scanner — runs every 5 minutes automatically ──
+# ── Background scanner ────────────────────────────────────────────────
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 async def background_scanner():
-    """Scans all pairs every 5 minutes. Sends Telegram automatically."""
-    await asyncio.sleep(10)  # wait for server to start
+    await asyncio.sleep(10)
     while True:
         for symbol in PAIRS:
             try:
-                compute_signal(symbol)   # Telegram sent inside if signal valid
+                compute_signal(symbol)
             except Exception as e:
                 print(f"[Scanner] {symbol} error: {e}")
-            await asyncio.sleep(3)       # small gap between pairs
-        await asyncio.sleep(300)         # wait 5 minutes before next full scan
+            await asyncio.sleep(3)
+        await asyncio.sleep(300)
 
 
 @app.on_event("startup")
@@ -237,17 +217,16 @@ async def startup_event():
     asyncio.create_task(background_scanner())
 
 
-# ── Endpoints ──────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"status": "Bot is running ✅", "version": "5.0.0"}
+    return {"status": "Bot is running ✅", "version": "6.0.0"}
 
 @app.get("/health")
 def health():
     try:
-        spot  = get_spot()
-        price = spot.get_ticker("BTCUSDT")
+        price = get_spot().get_ticker("BTCUSDT")
         return {"status": "ok ✅", "btc_price": price.get("price")}
     except Exception as e:
         return {"error": str(e)}
@@ -279,7 +258,9 @@ def scan_all_pairs():
                 "confidence": sig["confidence"],
                 "score":      sig["score"],
                 "rsi":        sig["rsi"],
-                "price":      sig["price"]
+                "price":      sig["price"],
+                "adx":        sig["adx"],
+                "cvd":        sig.get("cvd", 0),
             })
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
@@ -318,6 +299,7 @@ def get_active_trades():
             "entry_price": t.entry_price,
             "stop_loss":   t.stop_loss,
             "take_profit": t.take_profit,
+            "trailing_sl": t.trailing_sl,   # NEW
             "opened_at":   str(t.opened_at)
         }
         for symbol, t in active_trades.items()
@@ -340,7 +322,8 @@ def auto_scan():
             "status":      "Scan complete",
             "open_trades": len(auto_trader.open_trades),
             "trades":      auto_trader.open_trades,
-            "history":     auto_trader.trade_history[-5:]
+            "history":     auto_trader.trade_history[-5:],
+            "daily_pnl":   auto_trader.daily_pnl,           # NEW
         }
     except Exception as e:
         return {"error": str(e)}
@@ -348,7 +331,33 @@ def auto_scan():
 @app.get("/auto/status")
 def auto_status():
     return {
-        "open_trades":  auto_trader.open_trades,
-        "total_closed": len(auto_trader.trade_history),
-        "history":      auto_trader.trade_history[-10:]
+        "open_trades":         auto_trader.open_trades,
+        "total_closed":        len(auto_trader.trade_history),
+        "history":             auto_trader.trade_history[-10:],
+        "daily_pnl":           auto_trader.daily_pnl,        # NEW
+        "consecutive_losses":  auto_trader.consecutive_losses,  # NEW
+    }
+
+# ── NEW: Performance summary endpoint ─────────────────────────────────
+@app.get("/performance")
+def performance():
+    history = auto_trader.trade_history
+    if not history:
+        return {"message": "No trades yet"}
+    wins   = [t for t in history if t["pnl_pct"] > 0]
+    losses = [t for t in history if t["pnl_pct"] <= 0]
+    total_pnl = sum(t["pnl_pct"] for t in history)
+    win_rate  = round(len(wins) / len(history) * 100, 1) if history else 0
+    avg_win   = round(sum(t["pnl_pct"] for t in wins) / len(wins), 2)   if wins   else 0
+    avg_loss  = round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0
+    return {
+        "total_trades":  len(history),
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "win_rate":      f"{win_rate}%",
+        "total_pnl":     f"{round(total_pnl, 2)}%",
+        "avg_win":       f"{avg_win}%",
+        "avg_loss":      f"{avg_loss}%",
+        "daily_pnl":     f"{auto_trader.daily_pnl:.2f}%",
+        "recent_trades": history[-5:],
     }
