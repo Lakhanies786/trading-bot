@@ -1,22 +1,21 @@
 import asyncio
 import os
 import time
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
-app = FastAPI(title="MEXC Trading Bot", version="6.0.0")
+app = FastAPI(title="MEXC Trading Bot", version="6.1.0")
 
 def get_spot():
     from mexc.client import MEXCSpotClient
     return MEXCSpotClient()
 
+# ✅ FIX: Separate dict for CONFIRMED trades only (user must explicitly start monitor)
 active_trades: dict = {}
 
-# ── Signal cooldown state ──────────────────────────────────────────────
 _signal_state: dict = {}
 CONFIRM_COUNT  = 3
 COOLDOWN_SECS  = 900
 
-# ── Telegram alert dedup ───────────────────────────────────────────────
 _last_alert: dict = {}
 ALERT_COOLDOWN = 900
 
@@ -146,58 +145,58 @@ def compute_signal(symbol: str) -> dict:
         maybe_send_alert(symbol, final_signal, price, stop_loss, take_profit, risk_reward, final_strength)
 
     return {
-        "symbol":              symbol,
-        "signal":              final_signal,
-        "confidence":          main.get("confidence", "0%"),
-        "mtf_confidence":      mtf_confidence,
-        "agreement":           final_strength,
+        "symbol":             symbol,
+        "signal":             final_signal,
+        "confidence":         main.get("confidence", "0%"),
+        "mtf_confidence":     mtf_confidence,
+        "agreement":          final_strength,
         "timeframes": {
             "15m": sig_15m["signal"],
             "1h":  sig_1h["signal"],
             "4h":  sig_4h["signal"],
         },
-        "ob_signal":           ob_signal,
-        "bid_ask_ratio":       ob_analysis["bid_ask_ratio"],
-        "ob_imbalance":        ob_analysis.get("imbalance", 0),      # NEW
-        "ob_liquidity":        ob_analysis.get("liquidity", 0),      # NEW
-        "ob_spread_pct":       ob_analysis.get("spread_pct", 0),     # NEW
-        "total_bid_volume":    ob_analysis["total_bid_volume"],
-        "total_ask_volume":    ob_analysis["total_ask_volume"],
-        "biggest_buy_wall":    ob_analysis["biggest_buy_wall"],
-        "biggest_sell_wall":   ob_analysis["biggest_sell_wall"],
-        "buy_wall_price":      ob_analysis["buy_wall_price"],
-        "sell_wall_price":     ob_analysis["sell_wall_price"],
-        "price":               price,
-        "rsi":                 main["rsi"],
-        "macd_hist":           main["macd_hist"],
-        "ema9":                main["ema9"],
-        "ema21":               main["ema21"],
-        "ema50":               main["ema50"],
-        "adx":                 main["adx"],
-        "adx_pos":             main.get("adx_pos", 0),               # NEW
-        "adx_neg":             main.get("adx_neg", 0),               # NEW
-        "cvd":                 main.get("cvd", 0),                   # NEW
-        "roc":                 main.get("roc", 0),                   # NEW
-        "bb_lower":            main["bb_lower"],
-        "bb_upper":            main["bb_upper"],
-        "atr":                 main["atr"],
-        "stop_loss":           stop_loss,
-        "take_profit":         take_profit,
-        "position_size":       main["position_size"],
-        "risk_reward":         risk_reward,
-        "score":               main.get("score"),
-        "vwap":                main.get("vwap"),
-        "vol_ratio":           main.get("vol_ratio"),
-        "stoch_k":             main.get("stoch_k"),
-        "nearest_support":     main.get("nearest_support"),          # NEW
-        "nearest_resistance":  main.get("nearest_resistance"),       # NEW
-        "fib_618":             main.get("fib_618"),                  # NEW
-        "fib_382":             main.get("fib_382"),                  # NEW
-        "reasons":             all_reasons,
+        "ob_signal":          ob_signal,
+        "bid_ask_ratio":      ob_analysis["bid_ask_ratio"],
+        "ob_imbalance":       ob_analysis.get("imbalance", 0),
+        "ob_liquidity":       ob_analysis.get("liquidity", 0),
+        "ob_spread_pct":      ob_analysis.get("spread_pct", 0),
+        "total_bid_volume":   ob_analysis["total_bid_volume"],
+        "total_ask_volume":   ob_analysis["total_ask_volume"],
+        "biggest_buy_wall":   ob_analysis["biggest_buy_wall"],
+        "biggest_sell_wall":  ob_analysis["biggest_sell_wall"],
+        "buy_wall_price":     ob_analysis["buy_wall_price"],
+        "sell_wall_price":    ob_analysis["sell_wall_price"],
+        "price":              price,
+        "rsi":                main["rsi"],
+        "macd_hist":          main["macd_hist"],
+        "ema9":               main["ema9"],
+        "ema21":              main["ema21"],
+        "ema50":              main["ema50"],
+        "adx":                main["adx"],
+        "adx_pos":            main.get("adx_pos", 0),
+        "adx_neg":            main.get("adx_neg", 0),
+        "cvd":                main.get("cvd", 0),
+        "roc":                main.get("roc", 0),
+        "bb_lower":           main["bb_lower"],
+        "bb_upper":           main["bb_upper"],
+        "atr":                main["atr"],
+        "stop_loss":          stop_loss,
+        "take_profit":        take_profit,
+        "position_size":      main["position_size"],
+        "risk_reward":        risk_reward,
+        "score":              main.get("score"),
+        "vwap":               main.get("vwap"),
+        "vol_ratio":          main.get("vol_ratio"),
+        "stoch_k":            main.get("stoch_k"),
+        "nearest_support":    main.get("nearest_support"),
+        "nearest_resistance": main.get("nearest_resistance"),
+        "fib_618":            main.get("fib_618"),
+        "fib_382":            main.get("fib_382"),
+        "reasons":            all_reasons,
     }
 
 
-# ── Background scanner ────────────────────────────────────────────────
+# ── Background scanner — SIGNAL ONLY, never starts monitor ────────────
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 async def background_scanner():
@@ -205,6 +204,7 @@ async def background_scanner():
     while True:
         for symbol in PAIRS:
             try:
+                # ✅ FIX: scanner only computes signals, NEVER touches active_trades
                 compute_signal(symbol)
             except Exception as e:
                 print(f"[Scanner] {symbol} error: {e}")
@@ -221,7 +221,7 @@ async def startup_event():
 
 @app.get("/")
 def root():
-    return {"status": "Bot is running ✅", "version": "6.0.0"}
+    return {"status": "Bot is running ✅", "version": "6.1.0"}
 
 @app.get("/health")
 def health():
@@ -273,12 +273,47 @@ def get_spot_account():
     except Exception as e:
         return {"error": str(e)}
 
+
+# ✅ FIX: /monitor/start now validates everything before starting
 @app.post("/monitor/start")
 async def start_monitor(
     symbol: str, direction: str, entry_price: float,
     stop_loss: float, take_profit: float, market: str = "spot"
 ):
     try:
+        # ✅ FIX 1: Reject if trade already being monitored
+        if symbol in active_trades:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{symbol} is already being monitored. Stop it first."
+            )
+
+        # ✅ FIX 2: Validate all values are real before creating trade
+        if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="entry_price, stop_loss and take_profit must all be greater than 0"
+            )
+
+        # ✅ FIX 3: Validate SL is on correct side of entry
+        if direction == "BUY" and stop_loss >= entry_price:
+            raise HTTPException(
+                status_code=400,
+                detail=f"BUY trade: stop_loss ({stop_loss}) must be BELOW entry ({entry_price})"
+            )
+        if direction == "SELL" and stop_loss <= entry_price:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SELL trade: stop_loss ({stop_loss}) must be ABOVE entry ({entry_price})"
+            )
+
+        # ✅ FIX 4: Validate direction
+        if direction not in ("BUY", "SELL"):
+            raise HTTPException(
+                status_code=400,
+                detail="direction must be BUY or SELL"
+            )
+
         from monitor.trade_monitor import OpenTrade, monitor_trade
         trade = OpenTrade(
             symbol=symbol, direction=direction,
@@ -287,30 +322,47 @@ async def start_monitor(
         )
         active_trades[symbol] = trade
         asyncio.create_task(monitor_trade(trade))
-        return {"status": "Monitoring started ✅", "symbol": symbol}
+        return {
+            "status":      "Monitoring started ✅",
+            "symbol":      symbol,
+            "direction":   direction,
+            "entry_price": entry_price,
+            "stop_loss":   stop_loss,
+            "take_profit": take_profit,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e)}
 
+
 @app.get("/monitor/active")
 def get_active_trades():
+    # ✅ FIX: Returns empty dict if no trades — never shows phantom trades
+    if not active_trades:
+        return {"message": "No active trades being monitored", "trades": {}}
     return {
-        symbol: {
-            "direction":   t.direction,
-            "entry_price": t.entry_price,
-            "stop_loss":   t.stop_loss,
-            "take_profit": t.take_profit,
-            "trailing_sl": t.trailing_sl,   # NEW
-            "opened_at":   str(t.opened_at)
+        "trades": {
+            symbol: {
+                "direction":   t.direction,
+                "entry_price": t.entry_price,
+                "stop_loss":   t.stop_loss,
+                "take_profit": t.take_profit,
+                "trailing_sl": t.trailing_sl,
+                "opened_at":   str(t.opened_at)
+            }
+            for symbol, t in active_trades.items()
         }
-        for symbol, t in active_trades.items()
     }
+
 
 @app.delete("/monitor/stop/{symbol}")
 def stop_monitor(symbol: str):
     if symbol in active_trades:
         del active_trades[symbol]
         return {"status": f"Stopped monitoring {symbol} ✅"}
-    return {"status": "Trade not found"}
+    return {"status": "Trade not found — nothing to stop"}
+
 
 from strategy.auto_trader import auto_trader
 
@@ -323,7 +375,7 @@ def auto_scan():
             "open_trades": len(auto_trader.open_trades),
             "trades":      auto_trader.open_trades,
             "history":     auto_trader.trade_history[-5:],
-            "daily_pnl":   auto_trader.daily_pnl,           # NEW
+            "daily_pnl":   auto_trader.daily_pnl,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -331,24 +383,23 @@ def auto_scan():
 @app.get("/auto/status")
 def auto_status():
     return {
-        "open_trades":         auto_trader.open_trades,
-        "total_closed":        len(auto_trader.trade_history),
-        "history":             auto_trader.trade_history[-10:],
-        "daily_pnl":           auto_trader.daily_pnl,        # NEW
-        "consecutive_losses":  auto_trader.consecutive_losses,  # NEW
+        "open_trades":        auto_trader.open_trades,
+        "total_closed":       len(auto_trader.trade_history),
+        "history":            auto_trader.trade_history[-10:],
+        "daily_pnl":          auto_trader.daily_pnl,
+        "consecutive_losses": auto_trader.consecutive_losses,
     }
 
-# ── NEW: Performance summary endpoint ─────────────────────────────────
 @app.get("/performance")
 def performance():
     history = auto_trader.trade_history
     if not history:
         return {"message": "No trades yet"}
-    wins   = [t for t in history if t["pnl_pct"] > 0]
-    losses = [t for t in history if t["pnl_pct"] <= 0]
+    wins      = [t for t in history if t["pnl_pct"] > 0]
+    losses    = [t for t in history if t["pnl_pct"] <= 0]
     total_pnl = sum(t["pnl_pct"] for t in history)
     win_rate  = round(len(wins) / len(history) * 100, 1) if history else 0
-    avg_win   = round(sum(t["pnl_pct"] for t in wins) / len(wins), 2)   if wins   else 0
+    avg_win   = round(sum(t["pnl_pct"] for t in wins)   / len(wins),   2) if wins   else 0
     avg_loss  = round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0
     return {
         "total_trades":  len(history),
