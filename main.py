@@ -13,9 +13,9 @@ app = FastAPI(title="MEXC Trading Bot", version="7.0.0")
 
 # ── In-memory signal log (persisted to signal_log.json) ──────────────
 SIGNAL_LOG_FILE = "signal_log.json"
-MIN_CONFIDENCE  = 60      # lowered from 70% to log more signals
-MIN_SCORE       = 8       # lowered from 10 to log more signals
-MIN_VOL_RATIO   = 0.3     # lowered from 0.5
+MIN_CONFIDENCE  = 65      # raised — require stronger confidence
+MIN_SCORE       = 10      # raised — require at least 10/16
+MIN_VOL_RATIO   = 0.8     # raised — require decent volume
 TRADE_HRS_UTC   = (8, 17) # FIX: time filter
 REQUIRE_4H      = True    # FIX: 4H must agree
 MAX_SIGNAL_AGE  = 24      # auto-expire after 24h
@@ -248,6 +248,14 @@ def passes_filters(sig: dict) -> bool:
         if sig["signal"] == "SELL" and tf4h == "BUY":  return False
     if not sig.get("stop_loss") or not sig.get("take_profit"):
         return False
+    # MACD histogram must agree with signal direction
+    macd = sig.get("macd_hist") or 0
+    if sig["signal"] == "BUY"  and macd <= 0: return False
+    if sig["signal"] == "SELL" and macd >= 0: return False
+    # Order book must not be strongly against signal
+    ob_signal = sig.get("ob_signal", "HOLD")
+    if sig["signal"] == "BUY"  and ob_signal == "SELL": return False
+    if sig["signal"] == "SELL" and ob_signal == "BUY":  return False
     return True
 
 
