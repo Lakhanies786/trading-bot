@@ -34,6 +34,124 @@ def prepare_dataframe(klines) -> pd.DataFrame:
     return df
 
 
+# ══════════════════════════════════════════════════════════════════════
+# MARKET REGIME DETECTOR
+# Returns: TRENDING_BULL | TRENDING_BEAR | RANGING | VOLATILE
+# ══════════════════════════════════════════════════════════════════════
+def detect_market_regime(df: pd.DataFrame) -> dict:
+    """
+    Detects what kind of market we are in right now.
+    TRENDING  → ADX > 25, trade WITH trend only
+    RANGING   → ADX < 20, signals are unreliable — skip
+    VOLATILE  → ATR spike > 2x average — too dangerous — skip
+    """
+    last = df.iloc[-1]
+
+    adx     = float(last["adx"])     if pd.notna(last["adx"])     else 0
+    adx_pos = float(last["adx_pos"]) if pd.notna(last["adx_pos"]) else 0
+    adx_neg = float(last["adx_neg"]) if pd.notna(last["adx_neg"]) else 0
+    atr     = float(last["atr"])     if pd.notna(last["atr"])     else 0
+
+    # ATR spike: compare current ATR to its 20-period average
+    atr_avg = float(df["atr"].rolling(20).mean().iloc[-1]) if len(df) >= 20 else atr
+    atr_ratio = atr / atr_avg if atr_avg > 0 else 1.0
+
+    # Regime classification
+    if atr_ratio > 2.0:
+        regime = "VOLATILE"
+        regime_reason = f"⚡ ATR spike {atr_ratio:.1f}x average — news/manipulation risk"
+        tradeable = False
+    elif adx >= 25 and adx_pos > adx_neg:
+        regime = "TRENDING_BULL"
+        regime_reason = f"📈 Strong bullish trend — ADX {adx:.1f}, +DI {adx_pos:.1f} leads"
+        tradeable = True
+    elif adx >= 25 and adx_neg > adx_pos:
+        regime = "TRENDING_BEAR"
+        regime_reason = f"📉 Strong bearish trend — ADX {adx:.1f}, -DI {adx_neg:.1f} leads"
+        tradeable = True
+    elif adx >= 20:
+        regime = "WEAK_TREND"
+        regime_reason = f"〰️ Weak trend — ADX {adx:.1f}, signals may be unreliable"
+        tradeable = True   # allow but with caution
+    else:
+        regime = "RANGING"
+        regime_reason = f"↔️ Ranging market — ADX {adx:.1f} — signals unreliable, skip"
+        tradeable = False
+
+    return {
+        "regime":        regime,
+        "regime_reason": regime_reason,
+        "tradeable":     tradeable,
+        "adx":           round(adx, 2),
+        "atr_ratio":     round(atr_ratio, 2),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DAILY BIAS (HTF — Higher Timeframe Bias)
+# Tells us what the BIG money is doing on the daily chart
+# ══════════════════════════════════════════════════════════════════════
+def detect_daily_bias(df_1d: pd.DataFrame) -> dict:
+    """
+    Analyses the daily candle to determine overall market bias.
+    Only trade in the direction of the daily bias.
+    BUY signals when bias=BEARISH are blocked.
+    SELL signals when bias=BULLISH are blocked.
+    """
+    if len(df_1d) < 50:
+        return {"bias": "NEUTRAL", "bias_reason": "Insufficient daily data", "bias_strength": "WEAK"}
+
+    df_1d = df_1d.copy()
+    df_1d["ema21_d"]  = ta.trend.ema_indicator(df_1d["close"], window=21)
+    df_1d["ema50_d"]  = ta.trend.ema_indicator(df_1d["close"], window=50)
+    df_1d["adx_d"]    = ta.trend.adx(df_1d["high"], df_1d["low"], df_1d["close"], window=14)
+    df_1d["adx_pos_d"]= ta.trend.adx_pos(df_1d["high"], df_1d["low"], df_1d["close"], window=14)
+    df_1d["adx_neg_d"]= ta.trend.adx_neg(df_1d["high"], df_1d["low"], df_1d["close"], window=14)
+
+    last  = df_1d.iloc[-1]
+    prev  = df_1d.iloc[-2]
+    price = float(last["close"])
+
+    ema21_d   = float(last["ema21_d"])  if pd.notna(last["ema21_d"])  else price
+    ema50_d   = float(last["ema50_d"])  if pd.notna(last["ema50_d"])  else price
+    adx_d     = float(last["adx_d"])    if pd.notna(last["adx_d"])    else 0
+    adx_pos_d = float(last["adx_pos_d"])if pd.notna(last["adx_pos_d"])else 0
+    adx_neg_d = float(last["adx_neg_d"])if pd.notna(last["adx_neg_d"])else 0
+
+    # Daily candle structure
+    daily_bullish_candle = last["close"] > last["open"]
+    price_above_ema21    = price > ema21_d
+    price_above_ema50    = price > ema50_d
+    ema21_above_ema50    = ema21_d > ema50_d
+
+    bull_points = sum([daily_bullish_candle, price_above_ema21,
+                       price_above_ema50, ema21_above_ema50, adx_pos_d > adx_neg_d])
+    bear_points = sum([not daily_bullish_candle, not price_above_ema21,
+                       not price_above_ema50, not ema21_above_ema50, adx_neg_d > adx_pos_d])
+
+    if bull_points >= 4:
+        bias          = "BULLISH"
+        bias_strength = "STRONG" if bull_points == 5 else "MODERATE"
+        bias_reason   = f"📅 Daily bias BULLISH — price above EMA21/50, bullish candle structure"
+    elif bear_points >= 4:
+        bias          = "BEARISH"
+        bias_strength = "STRONG" if bear_points == 5 else "MODERATE"
+        bias_reason   = f"📅 Daily bias BEARISH — price below EMA21/50, bearish candle structure"
+    else:
+        bias          = "NEUTRAL"
+        bias_strength = "WEAK"
+        bias_reason   = f"📅 Daily bias NEUTRAL — mixed signals, both directions allowed"
+
+    return {
+        "bias":          bias,
+        "bias_strength": bias_strength,
+        "bias_reason":   bias_reason,
+        "ema21_d":       round(ema21_d, 4),
+        "ema50_d":       round(ema50_d, 4),
+        "adx_d":         round(adx_d, 2),
+    }
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # ── EMA Stack ─────────────────────────────────────────
     df["ema9"]   = ta.trend.ema_indicator(df["close"], window=9)
@@ -413,4 +531,217 @@ def generate_signal(df: pd.DataFrame) -> dict:
         "position_size":     position_size,
         "risk_reward":       risk_reward,
         "reasons":           reasons,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BREAKOUT DETECTOR — Phase 1 (Warning) + Phase 2 (Confirmed Signal)
+#
+# Phase 1 — COMPRESSION: BB squeeze + volume drying up + price near
+#            key resistance/support → "Watch this level" warning
+#
+# Phase 2 — BREAKOUT CONFIRMED: candle CLOSES above/below the level
+#            with volume spike → full breakout signal with measured move
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_breakout(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
+    """
+    Detects two stages:
+
+    PHASE 1 — COMPRESSION (Pre-breakout warning):
+      - Bollinger Band width in bottom 20% of last 50 candles (squeeze)
+      - Volume ratio < 0.6x (market is quiet — accumulation)
+      - Price within 0.5% of a key resistance or support level
+      - ADX < 30 (not yet trending — energy building)
+      → Returns: phase=1, status=COMPRESSION, direction=UP/DOWN
+
+    PHASE 2 — BREAKOUT CONFIRMED:
+      - Phase 1 conditions were recently true (squeeze existed)
+      - Latest CLOSED candle broke and CLOSED beyond the key level
+      - Volume on breakout candle > 2x average (real conviction)
+      - 4H candle agrees with direction
+      → Returns: phase=2, status=CONFIRMED, measured_move_target
+    """
+
+    if len(df_1h) < 60 or len(df_4h) < 20:
+        return _no_breakout("Insufficient data")
+
+    last   = df_1h.iloc[-1]
+    prev   = df_1h.iloc[-2]
+    price  = float(last["close"])
+
+    # ── BB Width squeeze detection ────────────────────────────────────
+    bb_width_series = df_1h["bb_width"].dropna().tail(50)
+    bb_width_now    = float(last["bb_width"]) if pd.notna(last["bb_width"]) else 999
+    bb_width_pct20  = float(bb_width_series.quantile(0.20))  # bottom 20% threshold
+    is_squeeze      = bb_width_now <= bb_width_pct20
+
+    # ── Volume drying up (accumulation phase) ────────────────────────
+    vol_ratio = float(last["vol_ratio"]) if pd.notna(last["vol_ratio"]) else 1.0
+    is_quiet  = vol_ratio < 0.7
+
+    # ── Key resistance and support levels ────────────────────────────
+    # Use rolling 30-candle high/low as the key levels
+    lookback        = df_1h.tail(30)
+    key_resistance  = float(lookback["high"].max())
+    key_support     = float(lookback["low"].min())
+    range_height    = key_resistance - key_support   # for measured move
+
+    dist_to_res_pct = ((key_resistance - price) / price) * 100
+    dist_to_sup_pct = ((price - key_support)    / price) * 100
+
+    near_resistance = 0 < dist_to_res_pct < 0.8   # within 0.8% of resistance
+    near_support    = 0 < dist_to_sup_pct < 0.8   # within 0.8% of support
+
+    # ── ADX — not yet strongly trending (energy coiling) ─────────────
+    adx = float(last["adx"]) if pd.notna(last["adx"]) else 0
+    energy_coiling = adx < 30
+
+    # ── 4H direction ──────────────────────────────────────────────────
+    last_4h      = df_4h.iloc[-1]
+    tf4h_bullish = last_4h["close"] > last_4h["open"] and float(last_4h.get("ema9", last_4h["close"])) > float(last_4h.get("ema21", last_4h["close"]))
+    tf4h_bearish = last_4h["close"] < last_4h["open"] and float(last_4h.get("ema9", last_4h["close"])) < float(last_4h.get("ema21", last_4h["close"]))
+
+    # ── Breakout candle: CLOSED beyond level with volume ─────────────
+    breakout_vol        = vol_ratio > 2.0          # volume spike on breakout
+    closed_above_res    = prev["close"] < key_resistance <= last["close"]   # just closed above
+    closed_below_sup    = prev["close"] > key_support  >= last["close"]     # just closed below
+
+    # Was there a squeeze in the last 10 candles? (squeeze → breakout)
+    recent_squeeze = any(
+        float(df_1h["bb_width"].iloc[i]) <= bb_width_pct20
+        for i in range(-10, -1)
+        if pd.notna(df_1h["bb_width"].iloc[i])
+    )
+
+    # ── PHASE 2: CONFIRMED BREAKOUT ───────────────────────────────────
+    if closed_above_res and breakout_vol and recent_squeeze and tf4h_bullish:
+        measured_target = round(key_resistance + range_height, 4)
+        move_pct        = round((range_height / price) * 100, 2)
+        return {
+            "phase":            2,
+            "status":           "BREAKOUT_UP",
+            "direction":        "UP",
+            "breakout_level":   round(key_resistance, 4),
+            "measured_target":  measured_target,
+            "move_pct":         move_pct,
+            "range_height":     round(range_height, 4),
+            "vol_ratio":        round(vol_ratio, 2),
+            "bb_width":         round(bb_width_now, 4),
+            "adx":              round(adx, 2),
+            "message":          (
+                f"🚀 BREAKOUT UP CONFIRMED — closed above ${key_resistance:,.4f} "
+                f"with {vol_ratio:.1f}x volume. "
+                f"Measured move target: ${measured_target:,.4f} (+{move_pct}%)"
+            ),
+        }
+
+    if closed_below_sup and breakout_vol and recent_squeeze and tf4h_bearish:
+        measured_target = round(key_support - range_height, 4)
+        move_pct        = round((range_height / price) * 100, 2)
+        return {
+            "phase":            2,
+            "status":           "BREAKOUT_DOWN",
+            "direction":        "DOWN",
+            "breakout_level":   round(key_support, 4),
+            "measured_target":  measured_target,
+            "move_pct":         move_pct,
+            "range_height":     round(range_height, 4),
+            "vol_ratio":        round(vol_ratio, 2),
+            "bb_width":         round(bb_width_now, 4),
+            "adx":              round(adx, 2),
+            "message":          (
+                f"🔻 BREAKOUT DOWN CONFIRMED — closed below ${key_support:,.4f} "
+                f"with {vol_ratio:.1f}x volume. "
+                f"Measured move target: ${measured_target:,.4f} (-{move_pct}%)"
+            ),
+        }
+
+    # ── PHASE 1: COMPRESSION WARNING ─────────────────────────────────
+    if is_squeeze and energy_coiling:
+        if near_resistance:
+            strength = _compression_strength(is_squeeze, is_quiet, near_resistance, adx)
+            return {
+                "phase":           1,
+                "status":          "COMPRESSION",
+                "direction":       "UP",
+                "watch_level":     round(key_resistance, 4),
+                "measured_target": round(key_resistance + range_height, 4),
+                "move_pct":        round((range_height / price) * 100, 2),
+                "vol_ratio":       round(vol_ratio, 2),
+                "bb_width":        round(bb_width_now, 4),
+                "adx":             round(adx, 2),
+                "strength":        strength,
+                "message":         (
+                    f"⚡ COMPRESSION — Squeeze building near resistance ${key_resistance:,.4f}. "
+                    f"Watch for breakout. Measured target: ${key_resistance + range_height:,.4f} "
+                    f"(+{round((range_height/price)*100,1)}%). "
+                    f"BB width: {bb_width_now:.4f} | Vol: {vol_ratio:.1f}x | ADX: {adx:.1f}"
+                ),
+            }
+        if near_support:
+            strength = _compression_strength(is_squeeze, is_quiet, near_support, adx)
+            return {
+                "phase":           1,
+                "status":          "COMPRESSION",
+                "direction":       "DOWN",
+                "watch_level":     round(key_support, 4),
+                "measured_target": round(key_support - range_height, 4),
+                "move_pct":        round((range_height / price) * 100, 2),
+                "vol_ratio":       round(vol_ratio, 2),
+                "bb_width":        round(bb_width_now, 4),
+                "adx":             round(adx, 2),
+                "strength":        strength,
+                "message":         (
+                    f"⚡ COMPRESSION — Squeeze building near support ${key_support:,.4f}. "
+                    f"Watch for breakdown. Measured target: ${key_support - range_height:,.4f} "
+                    f"(-{round((range_height/price)*100,1)}%). "
+                    f"BB width: {bb_width_now:.4f} | Vol: {vol_ratio:.1f}x | ADX: {adx:.1f}"
+                ),
+            }
+        # Squeeze exists but not near a key level yet
+        return {
+            "phase":     1,
+            "status":    "COMPRESSION",
+            "direction": "UNKNOWN",
+            "watch_level":     round(key_resistance, 4),
+            "measured_target": None,
+            "move_pct":        round((range_height / price) * 100, 2),
+            "vol_ratio":       round(vol_ratio, 2),
+            "bb_width":        round(bb_width_now, 4),
+            "adx":             round(adx, 2),
+            "strength":        "BUILDING",
+            "message":         (
+                f"⏳ SQUEEZE BUILDING — BB compressing, waiting for price to approach "
+                f"resistance ${key_resistance:,.4f} or support ${key_support:,.4f}. "
+                f"Vol: {vol_ratio:.1f}x | ADX: {adx:.1f}"
+            ),
+        }
+
+    return _no_breakout(
+        f"No setup — BB width {bb_width_now:.4f} (squeeze threshold {bb_width_pct20:.4f}), "
+        f"ADX {adx:.1f}, vol {vol_ratio:.1f}x"
+    )
+
+
+def _compression_strength(squeeze: bool, quiet: bool, near_level: bool, adx: float) -> str:
+    points = sum([squeeze, quiet, near_level, adx < 20])
+    if points >= 3: return "STRONG"
+    if points == 2: return "MODERATE"
+    return "BUILDING"
+
+
+def _no_breakout(reason: str = "") -> dict:
+    return {
+        "phase":           0,
+        "status":          "NONE",
+        "direction":       "NONE",
+        "watch_level":     None,
+        "measured_target": None,
+        "move_pct":        0,
+        "vol_ratio":       0,
+        "bb_width":        0,
+        "adx":             0,
+        "strength":        "NONE",
+        "message":         f"No breakout setup detected. {reason}",
     }

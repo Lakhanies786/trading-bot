@@ -9,16 +9,22 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="MEXC Trading Bot", version="7.0.0")
+app = FastAPI(title="MEXC Trading Bot", version="8.0.0")
 
 # ── In-memory signal log (persisted to signal_log.json) ──────────────
-SIGNAL_LOG_FILE = "signal_log.json"
-MIN_CONFIDENCE  = 65      # raised — require stronger confidence
-MIN_SCORE       = 10      # raised — require at least 10/16
-MIN_VOL_RATIO   = 0.8     # raised — require decent volume
-TRADE_HRS_UTC   = (8, 17) # FIX: time filter
-REQUIRE_4H      = True    # FIX: 4H must agree
-MAX_SIGNAL_AGE  = 24      # auto-expire after 24h
+SIGNAL_LOG_FILE  = "signal_log.json"
+MIN_CONFIDENCE   = 70      # 70%+ only
+MIN_SCORE        = 11      # 11/16 minimum
+MIN_VOL_RATIO    = 1.0     # HARD BLOCK below 1.0x
+TRADE_HRS_UTC    = (8, 17) # UTC trading hours
+REQUIRE_4H       = True
+MAX_SIGNAL_AGE   = 24
+REQUIRE_ALL_3TF  = True
+MIN_RSI_BUY      = 45
+MAX_RSI_BUY      = 68
+MIN_RSI_SELL     = 32
+MAX_RSI_SELL     = 55
+NEWS_BLOCK_ENABLED = True  # NEW — set False to disable news filtering
 
 def load_signal_log() -> list:
     if not Path(SIGNAL_LOG_FILE).exists():
@@ -64,15 +70,112 @@ def send_telegram(msg: str):
         pass
 
 
-def maybe_send_alert(symbol, signal, price, sl, tp, rr, strength):
+def quality_gate_score(sig: dict) -> tuple[int, list[str], list[str]]:
+    """
+    Returns (passed_count, passed_list, failed_list).
+    HARD BLOCKS (instant fail regardless of other checks):
+      - Volume < 1.0x
+      - Not all 3 timeframes agree
+      - MACD opposes signal
+    SCORED CHECKS (must pass 6/7 for GREEN, 5/7 for blocked):
+    """
+    signal  = sig.get("signal", "HOLD")
+    conf    = int(sig.get("confidence", "0%").replace("%", ""))
+    score   = int(sig.get("score", "0/16").split("/")[0])
+    macd    = sig.get("macd_hist") or 0
+    vol     = sig.get("vol_ratio") or 0
+    adx     = sig.get("adx") or 0
+    rsi     = sig.get("rsi") or 50
+    mtf     = sig.get("mtf_confidence", "LOW")
+    tf      = sig.get("timeframes", {})
+
+    tf_vals   = [tf.get("15m"), tf.get("1h"), tf.get("4h")]
+    all_3_tf  = tf_vals.count(signal) == 3          # ALL 3 must agree now
+    macd_ok   = (signal == "BUY" and macd > 0) or (signal == "SELL" and macd < 0)
+    vol_ok    = vol >= 1.0                           # raised from 0.8 to 1.0 — hard block
+    rsi_ok    = (
+        (signal == "BUY"  and MIN_RSI_BUY  <= rsi <= MAX_RSI_BUY)  or
+        (signal == "SELL" and MIN_RSI_SELL <= rsi <= MAX_RSI_SELL)
+    )
+
+    checks = [
+        (conf   >= 70,   f"Confidence {conf}%",              f"Confidence {conf}% (need 70%+)"),
+        (score  >= 11,   f"Score {score}/16",                 f"Score {score}/16 (need 11+)"),
+        (macd_ok,        f"MACD confirms {signal}",           f"MACD opposes {signal} 🚫"),
+        (vol_ok,         f"Volume {vol:.1f}x",                f"Volume {vol:.1f}x (need 1.0x+) 🚫"),
+        (all_3_tf,       f"All 3 timeframes agree ✓",         f"Only {tf_vals.count(signal)}/3 TF agree 🚫"),
+        (adx    >= 25,   f"ADX {adx:.1f} strong trend",       f"ADX {adx:.1f} (need 25+)"),
+        (rsi_ok,         f"RSI {rsi:.1f} ideal zone",         f"RSI {rsi:.1f} — {'overbought' if rsi > MAX_RSI_BUY else 'no momentum'}"),
+    ]
+
+    passed = [label for ok, label, _ in checks if ok]
+    failed = [bad   for ok, _,   bad in checks if not ok]
+    return len(passed), passed, failed
+
+
+def maybe_send_alert(symbol, signal, price, sl, tp, rr, strength, sig: dict):
+    """Only sends Telegram alert if signal passes quality gate (6+ / 7 checks)."""
+    passed, passed_checks, failed_checks = quality_gate_score(sig)
+
+    # Require HIGH quality (6+/7) for Telegram alert
+    if passed < 6:
+        return
+
     now  = time.time()
     last = _last_alert.get(symbol, {})
     if last.get("signal") == signal and (now - last.get("sent_at", 0)) < ALERT_COOLDOWN:
         return
     _last_alert[symbol] = {"signal": signal, "sent_at": now}
+
+    gate_emoji = "🟢" if passed == 7 else "🟡"
+    passed_str = "\n".join(f"  ✅ {c}" for c in passed_checks)
+    failed_str = ("\n".join(f"  ❌ {c}" for c in failed_checks)) if failed_checks else "  —"
+    news_sentiment = sig.get("news_sentiment", "UNKNOWN")
+    news_score     = sig.get("news_score", 0)
+    news_emoji     = "📰🟢" if news_sentiment == "BULLISH" else ("📰🔴" if news_sentiment == "BEARISH" else "📰⚪")
+
     send_telegram(
-        f"SIGNAL {signal} - {symbol}\n"
-        f"Price: {price}\nSL: {sl}  TP: {tp}\nRR: {rr}\n{strength}"
+        f"{gate_emoji} HIGH QUALITY {signal} — {symbol}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Price: {price}\n"
+        f"🛑 SL: {sl}    🎯 TP: {tp}\n"
+        f"⚖️ R:R: {rr}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Quality Gate: {passed}/7 passed\n"
+        f"{passed_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{news_emoji} News: {news_sentiment} (score {news_score})\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{strength}"
+    )
+
+
+def _maybe_send_compression_alert(symbol: str, bo: dict, price: float):
+    """Sends a Phase 1 'watch this level' Telegram warning — 2h cooldown."""
+    now  = time.time()
+    key  = f"{symbol}_compression"
+    last = _last_alert.get(key, {})
+    if (now - last.get("sent_at", 0)) < 7200:
+        return
+    _last_alert[key] = {"sent_at": now}
+
+    direction_emoji = "📈" if bo["direction"] == "UP" else "📉"
+    target_str = f"${bo['measured_target']:,.4f}" if bo.get("measured_target") else "TBD"
+    send_telegram(
+        f"⚡ COMPRESSION ALERT — {symbol}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Current Price: ${price:,.4f}\n"
+        f"{direction_emoji} Direction: {bo['direction']}\n"
+        f"🎯 Watch Level: ${bo.get('watch_level', 0):,.4f}\n"
+        f"📐 Measured Target: {target_str} (+{bo.get('move_pct', 0):.1f}%)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Strength: {bo['strength']}\n"
+        f"BB Width: {bo.get('bb_width', 0):.4f} (squeezed)\n"
+        f"Volume: {bo.get('vol_ratio', 0):.1f}x (quiet = accumulation)\n"
+        f"ADX: {bo.get('adx', 0):.1f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ NOT a trade yet — watch for candle CLOSE\n"
+        f"beyond watch level with 2x+ volume to confirm."
     )
 
 
@@ -98,6 +201,7 @@ def stabilize_signal(symbol: str, raw_signal: str) -> str:
 
 def compute_signal(symbol: str) -> dict:
     from strategy.indicators import prepare_dataframe, add_indicators, generate_signal
+    from strategy.indicators import detect_market_regime, detect_daily_bias, detect_breakout
     from strategy.orderbook  import analyze_orderbook
 
     spot = get_spot()
@@ -105,10 +209,30 @@ def compute_signal(symbol: str) -> dict:
     klines_15m = spot.get_klines(symbol, interval="15m", limit=200)
     klines_1h  = spot.get_klines(symbol, interval="1h",  limit=200)
     klines_4h  = spot.get_klines(symbol, interval="4h",  limit=200)
+    klines_1d  = spot.get_klines(symbol, interval="1d",  limit=100)  # daily for HTF bias
 
     df_15m = add_indicators(prepare_dataframe(klines_15m))
     df_1h  = add_indicators(prepare_dataframe(klines_1h))
     df_4h  = add_indicators(prepare_dataframe(klines_4h))
+    df_1d  =                prepare_dataframe(klines_1d)   # no indicators needed — bias func adds its own
+
+    # ── Market Regime (based on 1h) ───────────────────────────────────
+    regime_info = detect_market_regime(df_1h)
+
+    # ── Daily HTF Bias ────────────────────────────────────────────────
+    bias_info = detect_daily_bias(df_1d)
+
+    # ── Breakout Detection (Phase 1 + Phase 2) ────────────────────────
+    breakout_info = detect_breakout(df_1h, df_4h)
+
+    # ── News Safety Check (Layer 0 — runs before signal logic) ────────
+    from news_filter import check_news_safety
+    news_info = check_news_safety(symbol) if NEWS_BLOCK_ENABLED else {
+        "safe": True, "risk_level": "CLEAR",
+        "reason": "News filter disabled",
+        "sentiment": "UNKNOWN", "news_score": 0,
+        "events": [], "risk_news": False,
+    }
 
     sig_15m = generate_signal(df_15m)
     sig_1h  = generate_signal(df_1h)
@@ -146,6 +270,58 @@ def compute_signal(symbol: str) -> dict:
     if final_signal != raw_signal:
         final_strength = f"⏳ HOLD — Waiting to confirm ({raw_signal} pending)"
 
+    # ── Market Regime Gate ────────────────────────────────────────────
+    # Block signals in ranging or volatile markets
+    regime_blocked = False
+    if not regime_info["tradeable"] and final_signal != "HOLD":
+        regime_blocked = True
+        final_signal   = "HOLD"
+        final_strength = f"🚫 BLOCKED — {regime_info['regime_reason']}"
+
+    # ── Daily Bias Gate ───────────────────────────────────────────────
+    # Only allow signals that align with the daily trend
+    bias_blocked = False
+    if not regime_blocked and final_signal != "HOLD":
+        bias = bias_info["bias"]
+        if bias == "BULLISH" and final_signal == "SELL":
+            bias_blocked   = True
+            final_signal   = "HOLD"
+            final_strength = f"🚫 BLOCKED — Daily bias is BULLISH, no SELL signals allowed"
+        elif bias == "BEARISH" and final_signal == "BUY":
+            bias_blocked   = True
+            final_signal   = "HOLD"
+            final_strength = f"🚫 BLOCKED — Daily bias is BEARISH, no BUY signals allowed"
+
+    # ── News Block Gate ───────────────────────────────────────────────
+    # Block signal entirely if high-impact event or risk news detected
+    news_blocked = False
+    if not regime_blocked and not bias_blocked and not news_info["safe"]:
+        news_blocked   = True
+        final_signal   = "HOLD"
+        final_strength = news_info["reason"]
+
+    # ── Additional: block BUY if news sentiment strongly bearish ──────
+    if (not news_blocked and not regime_blocked and not bias_blocked
+            and final_signal == "BUY"
+            and news_info["sentiment"] == "BEARISH"
+            and news_info["news_score"] < -40):
+        news_blocked   = True
+        final_signal   = "HOLD"
+        final_strength = f"🚫 BLOCKED — News sentiment strongly BEARISH (score {news_info['news_score']}) — no BUY allowed"
+
+    # ── Phase 2 Breakout: promote to signal if confirmed ─────────────
+    # If a confirmed breakout exists, treat it as a strong BUY/SELL
+    # regardless of whether the normal signal agrees (it often lags)
+    breakout_promotes = False
+    if breakout_info["phase"] == 2:
+        bo_dir = "BUY" if breakout_info["direction"] == "UP" else "SELL"
+        # Only promote if NOT blocked by regime or bias
+        if not regime_blocked and not bias_blocked:
+            if final_signal == "HOLD" or final_signal == bo_dir:
+                final_signal    = bo_dir
+                breakout_promotes = True
+                final_strength  = breakout_info["message"]
+
     main    = sig_1h
     price   = main["price"]
     atr_val = main["atr"]
@@ -169,10 +345,8 @@ def compute_signal(symbol: str) -> dict:
 
     all_reasons = [final_strength, mtf_agreement] + ob_analysis["ob_reasons"] + main["reasons"]
 
-    if final_signal in ("BUY", "SELL") and stop_loss and take_profit:
-        maybe_send_alert(symbol, final_signal, price, stop_loss, take_profit, risk_reward, final_strength)
-
-    return {
+    # Build result dict first so we can pass it to quality gate
+    result = {
         "symbol":             symbol,
         "signal":             final_signal,
         "confidence":         main.get("confidence", "0%"),
@@ -184,7 +358,6 @@ def compute_signal(symbol: str) -> dict:
             "4h":  sig_4h["signal"],
         },
         "ob_signal":          ob_signal,
-        "bid_ask_ratio":      ob_analysis["bid_ask_ratio"],
         "ob_imbalance":       ob_analysis.get("imbalance", 0),
         "ob_liquidity":       ob_analysis.get("liquidity", 0),
         "ob_spread_pct":      ob_analysis.get("spread_pct", 0),
@@ -194,6 +367,17 @@ def compute_signal(symbol: str) -> dict:
         "biggest_sell_wall":  ob_analysis["biggest_sell_wall"],
         "buy_wall_price":     ob_analysis["buy_wall_price"],
         "sell_wall_price":    ob_analysis["sell_wall_price"],
+        # ── Market Regime ──────────────────────────────────
+        "market_regime":       regime_info["regime"],
+        "regime_reason":       regime_info["regime_reason"],
+        "regime_tradeable":    regime_info["tradeable"],
+        "atr_ratio":           regime_info["atr_ratio"],
+        # ── Daily HTF Bias ─────────────────────────────────
+        "daily_bias":          bias_info["bias"],
+        "daily_bias_strength": bias_info["bias_strength"],
+        "daily_bias_reason":   bias_info["bias_reason"],
+        "ema21_daily":         bias_info["ema21_d"],
+        "ema50_daily":         bias_info["ema50_d"],
         "price":              price,
         "rsi":                main["rsi"],
         "macd_hist":          main["macd_hist"],
@@ -222,40 +406,80 @@ def compute_signal(symbol: str) -> dict:
         "fib_500":            main.get("fib_500"),
         "fib_382":            main.get("fib_382"),
         "reasons":            all_reasons,
+        # ── Breakout Detection ──────────────────────────────
+        "breakout_phase":     breakout_info["phase"],
+        "breakout_status":    breakout_info["status"],
+        "breakout_direction": breakout_info["direction"],
+        "breakout_watch":     breakout_info.get("watch_level") or breakout_info.get("breakout_level"),
+        "breakout_target":    breakout_info.get("measured_target"),
+        "breakout_move_pct":  breakout_info.get("move_pct", 0),
+        "breakout_strength":  breakout_info.get("strength", "NONE"),
+        "breakout_message":   breakout_info["message"],
+        "breakout_vol_ratio": breakout_info.get("vol_ratio", 0),
+        # ── News Awareness ─────────────────────────────────
+        "news_safe":          news_info["safe"],
+        "news_risk_level":    news_info["risk_level"],
+        "news_reason":        news_info["reason"],
+        "news_sentiment":     news_info["sentiment"],
+        "news_score":         news_info["news_score"],
+        "news_risk":          news_info["risk_news"],
+        "news_events":        [
+            {"title": e["title"], "minutes_away": e["minutes_away"]}
+            for e in news_info.get("events", [])[:3]
+        ],
     }
+
+    # ── Telegram: Phase 2 breakout fires through quality gate ─────────
+    if final_signal in ("BUY", "SELL") and stop_loss and take_profit:
+        maybe_send_alert(symbol, final_signal, price, stop_loss, take_profit,
+                         risk_reward, final_strength, result)
+
+    # ── Telegram: Phase 1 compression — separate "watch" alert ────────
+    elif breakout_info["phase"] == 1 and breakout_info["strength"] in ("STRONG", "MODERATE"):
+        _maybe_send_compression_alert(symbol, breakout_info, price)
+
+    return result
 
 
 # ── Signal log helpers ────────────────────────────────────────────────
 
 def passes_filters(sig: dict) -> bool:
-    """All fixes applied — signal must pass every filter to be logged."""
+    """Hard gates — signal must pass ALL to be logged. No exceptions."""
     if sig.get("signal") == "HOLD":
         return False
-    conf = int(sig.get("confidence", "0%").replace("%", ""))
-    if conf < MIN_CONFIDENCE:
-        return False
+
+    signal    = sig["signal"]
+    conf      = int(sig.get("confidence", "0%").replace("%", ""))
     score_num = int(sig.get("score", "0/16").split("/")[0])
-    if score_num < MIN_SCORE:
-        return False
-    if (sig.get("vol_ratio") or 0) < MIN_VOL_RATIO:
-        return False
-    hour_utc = datetime.now(timezone.utc).hour
-    if not (TRADE_HRS_UTC[0] <= hour_utc < TRADE_HRS_UTC[1]):
-        return False
-    if REQUIRE_4H:
-        tf4h = sig.get("timeframes", {}).get("4h", "HOLD")
-        if sig["signal"] == "BUY"  and tf4h == "SELL": return False
-        if sig["signal"] == "SELL" and tf4h == "BUY":  return False
-    if not sig.get("stop_loss") or not sig.get("take_profit"):
-        return False
-    # MACD histogram must agree with signal direction
-    macd = sig.get("macd_hist") or 0
-    if sig["signal"] == "BUY"  and macd <= 0: return False
-    if sig["signal"] == "SELL" and macd >= 0: return False
-    # Order book must not be strongly against signal
+    vol       = sig.get("vol_ratio") or 0
+    macd      = sig.get("macd_hist") or 0
+    rsi       = sig.get("rsi") or 50
+    adx       = sig.get("adx") or 0
+    tf        = sig.get("timeframes", {})
+    tf_vals   = [tf.get("15m"), tf.get("1h"), tf.get("4h")]
+    hour_utc  = datetime.now(timezone.utc).hour
+
+    # ── Hard blocks — any one = instant reject ─────────────────────────
+    if conf      < MIN_CONFIDENCE:                    return False  # <70%
+    if score_num < MIN_SCORE:                         return False  # <11/16
+    if vol       < MIN_VOL_RATIO:                     return False  # <1.0x HARD BLOCK
+    if not (TRADE_HRS_UTC[0] <= hour_utc < TRADE_HRS_UTC[1]): return False
+    if tf_vals.count(signal) < 3:                     return False  # all 3 TF must agree
+    if signal == "BUY"  and macd <= 0:                return False  # MACD must confirm
+    if signal == "SELL" and macd >= 0:                return False
+    if signal == "BUY"  and not (MIN_RSI_BUY  <= rsi <= MAX_RSI_BUY):  return False
+    if signal == "SELL" and not (MIN_RSI_SELL <= rsi <= MAX_RSI_SELL): return False
+    if adx < 25:                                      return False  # weak trend
+    if not sig.get("stop_loss") or not sig.get("take_profit"): return False
+    if not sig.get("regime_tradeable", True):         return False
+    daily_bias = sig.get("daily_bias", "NEUTRAL")
+    if signal == "BUY"  and daily_bias == "BEARISH":  return False
+    if signal == "SELL" and daily_bias == "BULLISH":  return False
     ob_signal = sig.get("ob_signal", "HOLD")
-    if sig["signal"] == "BUY"  and ob_signal == "SELL": return False
-    if sig["signal"] == "SELL" and ob_signal == "BUY":  return False
+    if signal == "BUY"  and ob_signal == "SELL":      return False
+    if signal == "SELL" and ob_signal == "BUY":       return False
+    # News safety — block if high-impact event or risk headline
+    if NEWS_BLOCK_ENABLED and not sig.get("news_safe", True): return False
     return True
 
 
@@ -305,6 +529,17 @@ def log_signal_entry(sig: dict):
         "exit_time":    None,
         "pnl_pct":      None,
         "hours_open":   0,
+        # ── Breakout tracking ──────────────────────────
+        "breakout_phase":    sig.get("breakout_phase", 0),
+        "breakout_status":   sig.get("breakout_status", "NONE"),
+        "breakout_target":   sig.get("breakout_target"),
+        "breakout_move_pct": sig.get("breakout_move_pct", 0),
+        "market_regime":     sig.get("market_regime", "UNKNOWN"),
+        "daily_bias":        sig.get("daily_bias", "NEUTRAL"),
+        # ── News ───────────────────────────────────────────
+        "news_sentiment":    sig.get("news_sentiment", "UNKNOWN"),
+        "news_score":        sig.get("news_score", 0),
+        "news_risk_level":   sig.get("news_risk_level", "CLEAR"),
     })
     save_signal_log(signal_log)
 
@@ -405,6 +640,9 @@ def generate_excel_bytes() -> bytes:
         ("Status","status",9),("Outcome","outcome",9),
         ("Exit Price","exit_price",13),("Exit Time","exit_time",16),
         ("Hours Open","hours_open",10),("PnL %","pnl_pct",9),
+        ("Breakout Phase","breakout_phase",14),("Breakout Status","breakout_status",16),
+        ("BO Target","breakout_target",14),("BO Move %","breakout_move_pct",12),
+        ("Market Regime","market_regime",14),("Daily Bias","daily_bias",12),
     ]
     for c,(h,_,w) in enumerate(cols):
         ws1.set_column(c,c,w); ws1.write(2,c,h,hdr)
@@ -533,6 +771,10 @@ def generate_excel_bytes() -> bytes:
         ("✅ Fibonacci Entry Guide",    "Shows before entry — hides after"),
         ("✅ 4H Exit Warning",          "Only fires if 4H CHANGES after entry"),
         ("✅ Signal Age Limit",         f"{MAX_SIGNAL_AGE}h — auto-expire old signals"),
+        ("✅ Market Regime Filter",      "ON — blocks RANGING + VOLATILE markets"),
+        ("✅ Daily HTF Bias Gate",       "ON — only trades WITH daily trend"),
+        ("✅ Breakout Detector",         "Phase 1 (compression) + Phase 2 (confirmed)"),
+        ("✅ News Filter",               "Economic calendar + CryptoPanic sentiment"),
         ("",""),
         ("── SIGNAL HEALTH ───────────────────────",""),
     ]
@@ -837,4 +1079,133 @@ def performance():
         "avg_loss":      f"{avg_loss}%",
         "daily_pnl":     f"{auto_trader.daily_pnl:.2f}%",
         "recent_trades": history[-5:],
+    }
+
+
+@app.get("/news")
+def get_news_status(symbol: str = "BTCUSDT"):
+    """
+    Check current news safety for a symbol.
+    GET /news?symbol=BTCUSDT
+    Returns sentiment, upcoming events, risk level.
+    """
+    from news_filter import check_news_safety, get_upcoming_events
+    try:
+        info   = check_news_safety(symbol.upper())
+        events = get_upcoming_events(within_minutes=240)  # next 4 hours
+        return {
+            "symbol":       symbol.upper(),
+            "safe":         info["safe"],
+            "risk_level":   info["risk_level"],
+            "reason":       info["reason"],
+            "sentiment":    info["sentiment"],
+            "news_score":   info["news_score"],
+            "risk_news":    info["risk_news"],
+            "upcoming_events": [
+                {
+                    "title":        e["title"],
+                    "minutes_away": e["minutes_away"],
+                    "in_blackout":  e["in_blackout"],
+                }
+                for e in events[:5]
+            ],
+            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/news/scan")
+def scan_news_all():
+    """Check news safety for all 5 pairs at once."""
+    from news_filter import check_news_safety
+    results = {}
+    for sym in PAIRS:
+        try:
+            info = check_news_safety(sym)
+            results[sym] = {
+                "safe":       info["safe"],
+                "risk_level": info["risk_level"],
+                "sentiment":  info["sentiment"],
+                "score":      info["news_score"],
+                "reason":     info["reason"],
+            }
+        except Exception as e:
+            results[sym] = {"error": str(e)}
+    blocked = [s for s, r in results.items() if not r.get("safe", True)]
+    return {
+        "summary":  f"{len(blocked)} pairs blocked by news" if blocked else "All pairs clear",
+        "blocked":  blocked,
+        "results":  results,
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BREAKOUT SCAN ENDPOINT
+# GET /breakout/scan — scans all pairs for Phase 1 or Phase 2 setups
+# GET /breakout/scan?symbol=BTCUSDT — single pair
+# ══════════════════════════════════════════════════════════════════════
+
+@app.get("/breakout/scan")
+def breakout_scan(symbol: str = None):
+    """
+    Scans for breakout setups across all pairs (or one specific pair).
+    Phase 1 = Compression building (watch alert)
+    Phase 2 = Confirmed breakout (trade signal)
+    """
+    from strategy.indicators import prepare_dataframe, add_indicators, detect_breakout
+
+    targets = [symbol.upper()] if symbol else PAIRS
+    results = []
+
+    for sym in targets:
+        try:
+            spot       = get_spot()
+            klines_1h  = spot.get_klines(sym, interval="1h",  limit=200)
+            klines_4h  = spot.get_klines(sym, interval="4h",  limit=60)
+            df_1h      = add_indicators(prepare_dataframe(klines_1h))
+            df_4h      = add_indicators(prepare_dataframe(klines_4h))
+            price      = float(df_1h["close"].iloc[-1])
+            bo         = detect_breakout(df_1h, df_4h)
+
+            results.append({
+                "symbol":             sym,
+                "price":              round(price, 4),
+                "breakout_phase":     bo["phase"],
+                "breakout_status":    bo["status"],
+                "breakout_direction": bo["direction"],
+                "watch_level":        bo.get("watch_level") or bo.get("breakout_level"),
+                "measured_target":    bo.get("measured_target"),
+                "move_pct":           bo.get("move_pct", 0),
+                "strength":           bo.get("strength", "NONE"),
+                "vol_ratio":          bo.get("vol_ratio", 0),
+                "bb_width":           bo.get("bb_width", 0),
+                "adx":                bo.get("adx", 0),
+                "message":            bo["message"],
+            })
+        except Exception as e:
+            results.append({"symbol": sym, "error": str(e)})
+
+    # Sort: Phase 2 first, then Phase 1 by strength, then no setup
+    def sort_key(r):
+        phase = r.get("breakout_phase", 0)
+        strength_order = {"STRONG": 0, "MODERATE": 1, "BUILDING": 2, "NONE": 3}
+        s = strength_order.get(r.get("strength", "NONE"), 3)
+        return (-phase, s)
+
+    results.sort(key=sort_key)
+
+    phase2 = [r for r in results if r.get("breakout_phase") == 2]
+    phase1 = [r for r in results if r.get("breakout_phase") == 1]
+
+    return {
+        "scanned":       len(results),
+        "phase2_count":  len(phase2),
+        "phase1_count":  len(phase1),
+        "summary":       (
+            f"{len(phase2)} confirmed breakout(s), {len(phase1)} compression setup(s)"
+            if phase2 or phase1 else "No breakout setups detected across all pairs"
+        ),
+        "results":       results,
     }
