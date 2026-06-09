@@ -12,10 +12,12 @@ from fastapi.responses import StreamingResponse
 app = FastAPI(title="MEXC Trading Bot", version="8.0.0")
 
 # ── In-memory signal log (persisted to signal_log.json) ──────────────
-SIGNAL_LOG_FILE  = "signal_log.json"
-MIN_CONFIDENCE   = 70      # 70%+ only
-MIN_SCORE        = 11      # 11/16 minimum
-MIN_VOL_RATIO    = 1.0     # HARD BLOCK below 1.0x
+SIGNAL_LOG_FILE   = "signal_log.json"
+BLOCKED_LOG_FILE  = "blocked_signals.json"   # NEW — every rejected signal logged here
+MIN_CONFIDENCE   = 50      # Lowered from 70 — testing phase (was filtering too aggressively)
+MIN_SCORE        = 10      # Lowered from 11 — testing phase
+MIN_VOL_RATIO    = 0.8     # Lowered from 1.0 — testing phase
+ADX_MIN          = 20      # Lowered from 25 — most ETH/BTC signals were 20-24 and got rejected
 TRADE_HRS_UTC    = (8, 17) # UTC trading hours
 REQUIRE_4H       = True
 MAX_SIGNAL_AGE   = 24
@@ -25,6 +27,13 @@ MAX_RSI_BUY      = 68
 MIN_RSI_SELL     = 32
 MAX_RSI_SELL     = 55
 NEWS_BLOCK_ENABLED = True  # NEW — set False to disable news filtering
+
+# ── Trade Journal Grade Thresholds ────────────────────────────────────
+# A-Grade: Current strict rules — the "real" signals
+GRADE_A = {"min_confidence": 70, "min_score": 11, "min_adx": 25, "min_volume": 1.0, "min_tf": 3}
+# B-Grade: Relaxed — signals worth tracking but not trading live yet
+GRADE_B = {"min_confidence": 55, "min_score":  9, "min_adx": 20, "min_volume": 0.8, "min_tf": 2}
+# C-Grade: Everything else that has a directional signal (not HOLD)
 
 def load_signal_log() -> list:
     if not Path(SIGNAL_LOG_FILE).exists():
@@ -38,6 +47,21 @@ def load_signal_log() -> list:
 def save_signal_log(signals: list):
     with open(SIGNAL_LOG_FILE, "w") as f:
         json.dump(signals, f, indent=2)
+
+def load_blocked_log() -> list:
+    if not Path(BLOCKED_LOG_FILE).exists():
+        return []
+    try:
+        with open(BLOCKED_LOG_FILE) as f:
+            return json.load(f)
+    except:
+        return []
+
+def save_blocked_log(blocked: list):
+    with open(BLOCKED_LOG_FILE, "w") as f:
+        json.dump(blocked, f, indent=2)
+
+blocked_log: list = load_blocked_log()
 
 signal_log: list = load_signal_log()
 
@@ -92,20 +116,20 @@ def quality_gate_score(sig: dict) -> tuple[int, list[str], list[str]]:
     tf_vals   = [tf.get("15m"), tf.get("1h"), tf.get("4h")]
     all_3_tf  = tf_vals.count(signal) == 3          # ALL 3 must agree now
     macd_ok   = (signal == "BUY" and macd > 0) or (signal == "SELL" and macd < 0)
-    vol_ok    = vol >= 1.0                           # raised from 0.8 to 1.0 — hard block
+    vol_ok    = vol >= MIN_VOL_RATIO                 # uses constant — change MIN_VOL_RATIO at top
     rsi_ok    = (
         (signal == "BUY"  and MIN_RSI_BUY  <= rsi <= MAX_RSI_BUY)  or
         (signal == "SELL" and MIN_RSI_SELL <= rsi <= MAX_RSI_SELL)
     )
 
     checks = [
-        (conf   >= 70,   f"Confidence {conf}%",              f"Confidence {conf}% (need 70%+)"),
-        (score  >= 11,   f"Score {score}/16",                 f"Score {score}/16 (need 11+)"),
-        (macd_ok,        f"MACD confirms {signal}",           f"MACD opposes {signal} 🚫"),
-        (vol_ok,         f"Volume {vol:.1f}x",                f"Volume {vol:.1f}x (need 1.0x+) 🚫"),
-        (all_3_tf,       f"All 3 timeframes agree ✓",         f"Only {tf_vals.count(signal)}/3 TF agree 🚫"),
-        (adx    >= 25,   f"ADX {adx:.1f} strong trend",       f"ADX {adx:.1f} (need 25+)"),
-        (rsi_ok,         f"RSI {rsi:.1f} ideal zone",         f"RSI {rsi:.1f} — {'overbought' if rsi > MAX_RSI_BUY else 'no momentum'}"),
+        (conf   >= MIN_CONFIDENCE, f"Confidence {conf}%",         f"Confidence {conf}% (need {MIN_CONFIDENCE}%+)"),
+        (score  >= MIN_SCORE,      f"Score {score}/16",            f"Score {score}/16 (need {MIN_SCORE}+)"),
+        (macd_ok,                  f"MACD confirms {signal}",      f"MACD opposes {signal} 🚫"),
+        (vol_ok,                   f"Volume {vol:.1f}x",           f"Volume {vol:.1f}x (need {MIN_VOL_RATIO}x+) 🚫"),
+        (all_3_tf,                 f"All 3 timeframes agree ✓",    f"Only {tf_vals.count(signal)}/3 TF agree 🚫"),
+        (adx    >= ADX_MIN,        f"ADX {adx:.1f} strong trend",  f"ADX {adx:.1f} (need {ADX_MIN}+)"),
+        (rsi_ok,                   f"RSI {rsi:.1f} ideal zone",    f"RSI {rsi:.1f} — {'overbought' if rsi > MAX_RSI_BUY else 'no momentum'}"),
     ]
 
     passed = [label for ok, label, _ in checks if ok]
@@ -443,6 +467,196 @@ def compute_signal(symbol: str) -> dict:
 
 # ── Signal log helpers ────────────────────────────────────────────────
 
+def grade_signal(sig: dict) -> str:
+    """
+    Grade every directional signal A / B / C — regardless of whether it
+    passes the hard gates. Used by the trade journal to classify ALL signals
+    so we can compare grade performance after 50-100 logged entries.
+
+    A-Grade : Current strict rules (conf≥70, score≥11, ADX≥25, vol≥1.0, all 3 TF)
+    B-Grade : Relaxed rules   (conf≥55, score≥9,  ADX≥20, vol≥0.8, 2/3 TF)
+    C-Grade : Everything else with a directional signal
+    """
+    if sig.get("signal", "HOLD") == "HOLD":
+        return "NONE"
+
+    signal    = sig["signal"]
+    conf      = int(str(sig.get("confidence", "0%")).replace("%", ""))
+    score_str = str(sig.get("score", "0/16"))
+    score     = int(score_str.split("/")[0]) if "/" in score_str else 0
+    adx       = sig.get("adx") or 0
+    vol       = sig.get("vol_ratio") or 0
+    tf        = sig.get("timeframes", {})
+    tf_vals   = [tf.get("15m"), tf.get("1h"), tf.get("4h")]
+    tf_agree  = tf_vals.count(signal)
+
+    g = GRADE_A
+    if (conf >= g["min_confidence"] and score >= g["min_score"]
+            and adx >= g["min_adx"] and vol >= g["min_volume"]
+            and tf_agree >= g["min_tf"]):
+        return "A"
+
+    g = GRADE_B
+    if (conf >= g["min_confidence"] and score >= g["min_score"]
+            and adx >= g["min_adx"] and vol >= g["min_volume"]
+            and tf_agree >= g["min_tf"]):
+        return "B"
+
+    return "C"
+
+
+def passes_filters_detail(sig: dict) -> tuple[bool, list[str]]:
+    """
+    Same logic as passes_filters() but returns (passed: bool, reasons: list[str]).
+    Every blocking reason is captured so we can log exactly what rejected the signal.
+    This is the engine behind the blocked_signals.json log.
+    """
+    if sig.get("signal") == "HOLD":
+        return False, ["Signal is HOLD"]
+
+    signal    = sig["signal"]
+    conf      = int(str(sig.get("confidence", "0%")).replace("%", ""))
+    score_num = int(str(sig.get("score", "0/16")).split("/")[0])
+    vol       = sig.get("vol_ratio") or 0
+    macd      = sig.get("macd_hist") or 0
+    rsi       = sig.get("rsi") or 50
+    adx       = sig.get("adx") or 0
+    tf        = sig.get("timeframes", {})
+    tf_vals   = [tf.get("15m"), tf.get("1h"), tf.get("4h")]
+    hour_utc  = datetime.now(timezone.utc).hour
+    daily_bias = sig.get("daily_bias", "NEUTRAL")
+    ob_signal  = sig.get("ob_signal", "HOLD")
+
+    reasons = []
+
+    if conf < MIN_CONFIDENCE:
+        reasons.append(f"Confidence {conf}% < {MIN_CONFIDENCE}% minimum")
+    if score_num < MIN_SCORE:
+        reasons.append(f"Score {score_num}/16 < {MIN_SCORE} minimum")
+    if vol < MIN_VOL_RATIO:
+        reasons.append(f"Volume {vol:.2f}x < {MIN_VOL_RATIO}x minimum")
+    if not (TRADE_HRS_UTC[0] <= hour_utc < TRADE_HRS_UTC[1]):
+        reasons.append(f"Outside trading hours (UTC {hour_utc}:00, window {TRADE_HRS_UTC[0]}-{TRADE_HRS_UTC[1]})")
+    if tf_vals.count(signal) < 3:
+        reasons.append(f"Only {tf_vals.count(signal)}/3 timeframes agree (15m={tf.get('15m')} 1h={tf.get('1h')} 4h={tf.get('4h')})")
+    if signal == "BUY"  and macd <= 0:
+        reasons.append(f"MACD {macd:.6f} opposes BUY signal")
+    if signal == "SELL" and macd >= 0:
+        reasons.append(f"MACD {macd:.6f} opposes SELL signal")
+    if signal == "BUY"  and not (MIN_RSI_BUY <= rsi <= MAX_RSI_BUY):
+        reasons.append(f"RSI {rsi:.1f} outside BUY zone ({MIN_RSI_BUY}-{MAX_RSI_BUY})")
+    if signal == "SELL" and not (MIN_RSI_SELL <= rsi <= MAX_RSI_SELL):
+        reasons.append(f"RSI {rsi:.1f} outside SELL zone ({MIN_RSI_SELL}-{MAX_RSI_SELL})")
+    if adx < ADX_MIN:
+        reasons.append(f"ADX {adx:.1f} < {ADX_MIN} minimum (weak trend)")
+    if not sig.get("stop_loss") or not sig.get("take_profit"):
+        reasons.append("No SL/TP calculated")
+    if not sig.get("regime_tradeable", True):
+        reasons.append(f"Market regime blocked: {sig.get('regime_reason', 'UNKNOWN')}")
+    if signal == "BUY"  and daily_bias == "BEARISH":
+        reasons.append("Daily bias BEARISH blocks BUY")
+    if signal == "SELL" and daily_bias == "BULLISH":
+        reasons.append("Daily bias BULLISH blocks SELL")
+    if signal == "BUY"  and ob_signal == "SELL":
+        reasons.append("Order book SELL pressure blocks BUY")
+    if signal == "SELL" and ob_signal == "BUY":
+        reasons.append("Order book BUY pressure blocks SELL")
+    if NEWS_BLOCK_ENABLED and not sig.get("news_safe", True):
+        reasons.append(f"News block: {sig.get('news_reason', 'risk event')}")
+
+    return len(reasons) == 0, reasons
+
+
+def log_blocked_signal(sig: dict, reasons: list[str]):
+    """
+    Record every rejected directional signal with the exact reason(s) it failed.
+    After 50-100 entries, /blocked/stats will tell you which filter
+    is blocking the most potentially-profitable signals.
+    """
+    global blocked_log
+    symbol = sig.get("symbol", "")
+    signal = sig.get("signal", "HOLD")
+    if signal == "HOLD":
+        return
+    now = datetime.now(timezone.utc)
+
+    # Deduplicate: skip same symbol+direction blocked in last 30 min
+    thirty_ago = (now - timedelta(minutes=30)).isoformat()
+    for b in blocked_log[-200:]:  # only scan recent entries
+        if (b["symbol"] == symbol and b["signal"] == signal
+                and b["logged_at"] > thirty_ago):
+            return
+
+    tf = sig.get("timeframes", {})
+    blocked_log.append({
+        "id":            f"BLK_{symbol}_{now.strftime('%Y%m%d_%H%M')}",
+        "logged_at":     now.isoformat(),
+        "date":          now.strftime("%Y-%m-%d"),
+        "time_utc":      now.strftime("%H:%M"),
+        "symbol":        symbol,
+        "signal":        signal,
+        "grade":         grade_signal(sig),
+        # ── Filter values at rejection time ──────────────────────────
+        "confidence":    sig.get("confidence", "0%"),
+        "score":         sig.get("score", "0/16"),
+        "adx":           round(sig.get("adx") or 0, 2),
+        "vol_ratio":     round(sig.get("vol_ratio") or 0, 2),
+        "rsi":           round(sig.get("rsi") or 0, 2),
+        "macd":          round(sig.get("macd_hist") or 0, 6),
+        "tf_15m":        tf.get("15m", "-"),
+        "tf_1h":         tf.get("1h", "-"),
+        "tf_4h":         tf.get("4h", "-"),
+        "daily_bias":    sig.get("daily_bias", "NEUTRAL"),
+        "market_regime": sig.get("market_regime", "UNKNOWN"),
+        "ob_signal":     sig.get("ob_signal", "HOLD"),
+        "news_safe":     sig.get("news_safe", True),
+        # ── Why it was blocked ────────────────────────────────────────
+        "blocked_reasons":  reasons,
+        "blocked_by":       _primary_blocker(reasons),
+        "reason_count":     len(reasons),
+        # ── Price context — fill in later to assess missed move ───────
+        "entry_price":   round(sig.get("price", 0), 6),
+        "stop_loss":     round(sig.get("stop_loss") or 0, 6),
+        "take_profit":   round(sig.get("take_profit") or 0, 6),
+        # ── Outcome tracking (updated by update_blocked_outcomes) ─────
+        "price_1h":      None,
+        "price_4h":      None,
+        "price_24h":     None,
+        "move_1h_pct":   None,   # would this have been profitable at 1h?
+        "move_4h_pct":   None,
+        "move_24h_pct":  None,
+        "max_profit_pct":   None,
+        "max_adverse_pct":  None,
+        "would_have_won":   None,   # True/False — did price hit TP before SL?
+    })
+    # Keep log bounded — last 500 blocked signals
+    if len(blocked_log) > 500:
+        blocked_log = blocked_log[-500:]
+    save_blocked_log(blocked_log)
+
+
+def _primary_blocker(reasons: list[str]) -> str:
+    """Classify the single most significant blocking reason for quick stats."""
+    keywords = [
+        ("Confidence",       "confidence"),
+        ("Score",            "score"),
+        ("Volume",           "volume"),
+        ("ADX",              "adx"),
+        ("timeframes",       "tf_alignment"),
+        ("MACD",             "macd"),
+        ("RSI",              "rsi"),
+        ("trading hours",    "outside_hours"),
+        ("regime",           "market_regime"),
+        ("Daily bias",       "daily_bias"),
+        ("Order book",       "orderbook"),
+        ("News",             "news"),
+    ]
+    for text, key in keywords:
+        if any(text.lower() in r.lower() for r in reasons):
+            return key
+    return "other"
+
+
 def passes_filters(sig: dict) -> bool:
     """Hard gates — signal must pass ALL to be logged. No exceptions."""
     if sig.get("signal") == "HOLD":
@@ -460,16 +674,16 @@ def passes_filters(sig: dict) -> bool:
     hour_utc  = datetime.now(timezone.utc).hour
 
     # ── Hard blocks — any one = instant reject ─────────────────────────
-    if conf      < MIN_CONFIDENCE:                    return False  # <70%
-    if score_num < MIN_SCORE:                         return False  # <11/16
-    if vol       < MIN_VOL_RATIO:                     return False  # <1.0x HARD BLOCK
+    if conf      < MIN_CONFIDENCE:                    return False
+    if score_num < MIN_SCORE:                         return False
+    if vol       < MIN_VOL_RATIO:                     return False
     if not (TRADE_HRS_UTC[0] <= hour_utc < TRADE_HRS_UTC[1]): return False
     if tf_vals.count(signal) < 3:                     return False  # all 3 TF must agree
     if signal == "BUY"  and macd <= 0:                return False  # MACD must confirm
     if signal == "SELL" and macd >= 0:                return False
     if signal == "BUY"  and not (MIN_RSI_BUY  <= rsi <= MAX_RSI_BUY):  return False
     if signal == "SELL" and not (MIN_RSI_SELL <= rsi <= MAX_RSI_SELL): return False
-    if adx < 25:                                      return False  # weak trend
+    if adx < ADX_MIN:                                 return False  # uses ADX_MIN constant
     if not sig.get("stop_loss") or not sig.get("take_profit"): return False
     if not sig.get("regime_tradeable", True):         return False
     daily_bias = sig.get("daily_bias", "NEUTRAL")
@@ -483,69 +697,99 @@ def passes_filters(sig: dict) -> bool:
     return True
 
 
-def log_signal_entry(sig: dict):
-    """Log a new signal to the in-memory + file log."""
+def log_signal_entry(sig: dict, force_grade: str = None):
+    """Log a new signal to the in-memory + file log.
+
+    Every directional signal is graded A/B/C even if it doesn't pass hard
+    gates (call with force_grade="B" or "C" from the all-signal journal path).
+    Only A-grade signals trigger Telegram; all grades are logged for analysis.
+    """
     global signal_log
     symbol = sig.get("symbol", "")
     signal = sig.get("signal", "HOLD")
-    now    = datetime.now(timezone.utc)
+    if signal == "HOLD":
+        return
+    now = datetime.now(timezone.utc)
 
-    # Deduplicate — skip same symbol+direction open in last 2h
+    grade = force_grade or grade_signal(sig)
+
+    # Deduplicate — skip same symbol+direction+grade open in last 2h
     two_hrs_ago = (now - timedelta(hours=2)).isoformat()
     for s in signal_log:
         if (s["symbol"] == symbol and s["signal"] == signal
+                and s.get("grade") == grade
                 and s["status"] == "OPEN" and s["logged_at"] > two_hrs_ago):
             return
 
     tf = sig.get("timeframes", {})
-    signal_log.append({
-        "id":           f"{symbol}_{now.strftime('%Y%m%d_%H%M')}",
+    entry = {
+        "id":           f"{symbol}_{grade}_{now.strftime('%Y%m%d_%H%M')}",
         "logged_at":    now.isoformat(),
         "date":         now.strftime("%Y-%m-%d"),
         "time_utc":     now.strftime("%H:%M"),
         "symbol":       symbol,
         "signal":       signal,
+        "grade":        grade,
+        # ── Signal filters at time of logging ────────────────────────
         "confidence":   sig.get("confidence", "0%"),
         "score":        sig.get("score", "0/16"),
+        "adx":          round(sig.get("adx") or 0, 2),
         "vol_ratio":    round(sig.get("vol_ratio") or 0, 2),
         "tf_15m":       tf.get("15m", "-"),
         "tf_1h":        tf.get("1h", "-"),
         "tf_4h":        tf.get("4h", "-"),
+        "trade_allowed": "YES" if passes_filters(sig) else "NO",
+        # ── Entry / risk management ───────────────────────────────────
         "entry_price":  round(sig.get("price", 0), 6),
-        "stop_loss":    round(sig.get("stop_loss", 0), 6),
-        "take_profit":  round(sig.get("take_profit", 0), 6),
+        "stop_loss":    round(sig.get("stop_loss") or 0, 6),
+        "take_profit":  round(sig.get("take_profit") or 0, 6),
         "risk_reward":  sig.get("risk_reward", "N/A"),
         "rsi":          round(sig.get("rsi") or 0, 2),
         "macd":         round(sig.get("macd_hist") or 0, 6),
-        "adx":          round(sig.get("adx") or 0, 2),
         "fib_618":      round(sig.get("fib_618") or 0, 6),
         "fib_500":      round(sig.get("fib_500") or 0, 6),
         "fib_382":      round(sig.get("fib_382") or 0, 6),
         "nearest_support":    round(sig.get("nearest_support") or 0, 6),
         "nearest_resistance": round(sig.get("nearest_resistance") or 0, 6),
+        # ── Outcome tracking ─────────────────────────────────────────
         "status":       "OPEN",
         "outcome":      "-",
         "exit_price":   None,
         "exit_time":    None,
         "pnl_pct":      None,
         "hours_open":   0,
-        # ── Breakout tracking ──────────────────────────
+        # After-signal snapshots (filled in by update_signal_outcomes)
+        "price_1h":     None,   # price 1h after signal
+        "price_4h":     None,   # price 4h after signal
+        "price_24h":    None,   # price 24h after signal
+        "pnl_1h":       None,   # % move vs entry at 1h mark
+        "pnl_4h":       None,
+        "pnl_24h":      None,
+        "max_profit_pct":   None,   # peak favourable move during trade
+        "max_drawdown_pct": None,   # peak adverse move during trade
+        # ── Context at signal time ────────────────────────────────────
         "breakout_phase":    sig.get("breakout_phase", 0),
         "breakout_status":   sig.get("breakout_status", "NONE"),
         "breakout_target":   sig.get("breakout_target"),
         "breakout_move_pct": sig.get("breakout_move_pct", 0),
         "market_regime":     sig.get("market_regime", "UNKNOWN"),
         "daily_bias":        sig.get("daily_bias", "NEUTRAL"),
-        # ── News ───────────────────────────────────────────
         "news_sentiment":    sig.get("news_sentiment", "UNKNOWN"),
         "news_score":        sig.get("news_score", 0),
         "news_risk_level":   sig.get("news_risk_level", "CLEAR"),
-    })
+    }
+    signal_log.append(entry)
     save_signal_log(signal_log)
 
 
 def update_signal_outcomes():
-    """Check open signals against current price — mark WIN/LOSS/EXPIRED."""
+    """
+    Check open signals against current price.
+    - Marks WIN / LOSS / EXPIRED when SL/TP hit or 24h elapsed.
+    - Records price snapshots at 1h, 4h, 24h after signal.
+    - Tracks max_profit_pct (best favourable move) and max_drawdown_pct
+      (worst adverse move) throughout the trade lifetime.
+    """
     global signal_log
     changed = False
     for sig in signal_log:
@@ -558,14 +802,42 @@ def update_signal_outcomes():
         except:
             continue
 
-        direction = sig["signal"]
-        sl        = sig["stop_loss"]
-        tp        = sig["take_profit"]
-        entry     = sig["entry_price"]
-        logged_at = datetime.fromisoformat(sig["logged_at"])
-        hours_open = round((datetime.now(timezone.utc) - logged_at).total_seconds() / 3600, 1)
+        direction  = sig["signal"]
+        sl         = sig["stop_loss"]
+        tp         = sig["take_profit"]
+        entry      = sig["entry_price"]
+        logged_at  = datetime.fromisoformat(sig["logged_at"])
+        now_utc    = datetime.now(timezone.utc)
+        hours_open = round((now_utc - logged_at).total_seconds() / 3600, 1)
         sig["hours_open"] = hours_open
 
+        # ── Directional move % from entry ────────────────────────────
+        if direction == "BUY":
+            move_pct = round(((price - entry) / entry) * 100, 4)
+        else:  # SELL
+            move_pct = round(((entry - price) / entry) * 100, 4)
+
+        # ── Max profit / max drawdown tracking ───────────────────────
+        prev_max = sig.get("max_profit_pct") or 0
+        prev_min = sig.get("max_drawdown_pct") or 0
+        sig["max_profit_pct"]   = round(max(prev_max, move_pct), 4)
+        sig["max_drawdown_pct"] = round(min(prev_min, move_pct), 4)
+
+        # ── Snapshot at 1h / 4h / 24h after signal ───────────────────
+        if hours_open >= 1 and sig.get("pnl_1h") is None:
+            sig["price_1h"] = round(price, 6)
+            sig["pnl_1h"]   = move_pct
+            changed = True
+        if hours_open >= 4 and sig.get("pnl_4h") is None:
+            sig["price_4h"] = round(price, 6)
+            sig["pnl_4h"]   = move_pct
+            changed = True
+        if hours_open >= 24 and sig.get("pnl_24h") is None:
+            sig["price_24h"] = round(price, 6)
+            sig["pnl_24h"]   = move_pct
+            changed = True
+
+        # ── Outcome detection ─────────────────────────────────────────
         outcome    = None
         exit_price = None
 
@@ -583,7 +855,7 @@ def update_signal_outcomes():
             sig["status"]     = "CLOSED"
             sig["outcome"]    = outcome
             sig["exit_price"] = round(exit_price, 6)
-            sig["exit_time"]  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            sig["exit_time"]  = now_utc.strftime("%Y-%m-%d %H:%M")
             if direction == "BUY":
                 sig["pnl_pct"] = round(((exit_price - entry) / entry) * 100, 4)
             else:
@@ -594,9 +866,80 @@ def update_signal_outcomes():
         save_signal_log(signal_log)
 
 
+
+
 # ── Excel generator (returns bytes for download) ──────────────────────
 
-def generate_excel_bytes() -> bytes:
+def update_blocked_outcomes():
+    """
+    For every blocked signal that has a valid SL/TP, check whether
+    price subsequently hit TP or SL — answering "would this have won?"
+    This is what makes the blocked log analytically useful.
+    """
+    global blocked_log
+    changed = False
+    now_utc = datetime.now(timezone.utc)
+
+    for b in blocked_log:
+        # Skip if already fully evaluated or no SL/TP
+        if b.get("would_have_won") is not None:
+            continue
+        entry = b.get("entry_price", 0)
+        sl    = b.get("stop_loss", 0)
+        tp    = b.get("take_profit", 0)
+        if not entry or not sl or not tp:
+            continue
+
+        try:
+            import requests as req
+            r     = req.get(f"https://api.mexc.com/api/v3/ticker/price?symbol={b['symbol']}", timeout=5)
+            price = float(r.json()["price"])
+        except:
+            continue
+
+        direction  = b["signal"]
+        logged_at  = datetime.fromisoformat(b["logged_at"])
+        hours_open = (now_utc - logged_at).total_seconds() / 3600
+
+        # Directional move %
+        if direction == "BUY":
+            move_pct = round(((price - entry) / entry) * 100, 4)
+        else:
+            move_pct = round(((entry - price) / entry) * 100, 4)
+
+        # Max profit / adverse tracking
+        prev_max = b.get("max_profit_pct") or 0
+        prev_adv = b.get("max_adverse_pct") or 0
+        b["max_profit_pct"]  = round(max(prev_max, move_pct), 4)
+        b["max_adverse_pct"] = round(min(prev_adv, move_pct), 4)
+
+        # Snapshot prices
+        if hours_open >= 1  and b.get("move_1h_pct")  is None:
+            b["price_1h"]    = round(price, 6)
+            b["move_1h_pct"] = move_pct
+            changed = True
+        if hours_open >= 4  and b.get("move_4h_pct")  is None:
+            b["price_4h"]    = round(price, 6)
+            b["move_4h_pct"] = move_pct
+            changed = True
+        if hours_open >= 24 and b.get("move_24h_pct") is None:
+            b["price_24h"]    = round(price, 6)
+            b["move_24h_pct"] = move_pct
+            changed = True
+
+        # Determine if it would have won (TP hit before SL within 24h)
+        if hours_open >= 24 or b.get("move_24h_pct") is not None:
+            if direction == "BUY":
+                would_win = price >= tp
+            else:
+                would_win = price <= tp
+            b["would_have_won"] = would_win
+            changed = True
+
+    if changed:
+        save_blocked_log(blocked_log)
+
+
     import xlsxwriter
     import pandas as pd
 
@@ -631,15 +974,21 @@ def generate_excel_bytes() -> bytes:
 
     cols = [
         ("Date","date",10),("Time UTC","time_utc",8),("Symbol","symbol",10),
-        ("Signal","signal",7),("Score","score",8),("Confidence","confidence",10),
-        ("Vol Ratio","vol_ratio",9),("15m","tf_15m",6),("1h","tf_1h",6),("4h","tf_4h",6),
+        ("Signal","signal",7),("Grade","grade",7),
+        ("Score","score",8),("Confidence","confidence",10),
+        ("ADX","adx",7),("Vol Ratio","vol_ratio",9),
+        ("15m","tf_15m",6),("1h","tf_1h",6),("4h","tf_4h",6),
+        ("Trade Allowed?","trade_allowed",13),
         ("Entry","entry_price",13),("Stop Loss","stop_loss",13),("Take Profit","take_profit",13),
-        ("R:R","risk_reward",8),("RSI","rsi",7),("ADX","adx",7),
+        ("R:R","risk_reward",8),("RSI","rsi",7),
         ("Fib 61.8%","fib_618",12),("Fib 50%","fib_500",10),("Fib 38.2%","fib_382",12),
         ("Support","nearest_support",13),("Resistance","nearest_resistance",13),
         ("Status","status",9),("Outcome","outcome",9),
         ("Exit Price","exit_price",13),("Exit Time","exit_time",16),
         ("Hours Open","hours_open",10),("PnL %","pnl_pct",9),
+        # After-signal snapshots
+        ("PnL @ 1h","pnl_1h",10),("PnL @ 4h","pnl_4h",10),("PnL @ 24h","pnl_24h",10),
+        ("Max Profit %","max_profit_pct",13),("Max Drawdown %","max_drawdown_pct",15),
         ("Breakout Phase","breakout_phase",14),("Breakout Status","breakout_status",16),
         ("BO Target","breakout_target",14),("BO Move %","breakout_move_pct",12),
         ("Market Regime","market_regime",14),("Daily Bias","daily_bias",12),
@@ -763,9 +1112,10 @@ def generate_excel_bytes() -> bytes:
         ("📉 Average Loss %",          f"{al}%"),
         ("",""),
         ("── ALL FIXES ACTIVE ────────────────────",""),
-        ("✅ Min Confidence",           f"{MIN_CONFIDENCE}%  ↑ raised from 50%"),
-        ("✅ Min Score",                f"{MIN_SCORE}/16  ↑ raised threshold"),
-        ("✅ Min Volume",               f"{MIN_VOL_RATIO}x  ↑ was 0.03x before"),
+        ("✅ Min Confidence",           f"{MIN_CONFIDENCE}%  (testing: lowered from 70%)"),
+        ("✅ Min Score",                f"{MIN_SCORE}/16  (testing: lowered from 11)"),
+        ("✅ Min Volume",               f"{MIN_VOL_RATIO}x  (testing: lowered from 1.0x)"),
+        ("✅ Min ADX",                  f"{ADX_MIN}  (testing: lowered from 25)"),
         ("✅ Time Filter",              f"{TRADE_HRS_UTC[0]}:00–{TRADE_HRS_UTC[1]}:00 UTC only"),
         ("✅ 4H Must Agree",            "ON — never trades against 4H trend"),
         ("✅ Fibonacci Entry Guide",    "Shows before entry — hides after"),
@@ -806,6 +1156,121 @@ def generate_excel_bytes() -> bytes:
         ws5.write(r2,0,lbl,lf)
         if val!="": ws5.write(r2,1,str(val),vf)
 
+    # ── Sheet 6: Blocked Signals ──────────────────────────────────────
+    ws6 = wb.add_worksheet("🚫 Blocked Signals"); ws6.set_tab_color("#F85149"); ws6.freeze_panes(3,0)
+    ws6.write(0, 0, f"Blocked Signals — What the Bot Rejected & Why  ({now_str})", title)
+    ws6.write(1, 0, "HIGH missed-win rate on a filter = consider relaxing it", ylw)
+
+    bcols = [
+        ("Date","date",10),("Time","time_utc",8),("Symbol","symbol",10),
+        ("Signal","signal",7),("Grade","grade",7),
+        ("Blocked By","blocked_by",14),("# Reasons","reason_count",10),
+        ("Conf","confidence",9),("Score","score",8),("ADX","adx",7),
+        ("Vol","vol_ratio",7),("RSI","rsi",7),
+        ("15m","tf_15m",6),("1h","tf_1h",6),("4h","tf_4h",6),
+        ("Daily Bias","daily_bias",11),("OB Signal","ob_signal",9),
+        ("Entry","entry_price",13),("SL","stop_loss",13),("TP","take_profit",13),
+        ("Move@1h%","move_1h_pct",10),("Move@4h%","move_4h_pct",10),("Move@24h%","move_24h_pct",11),
+        ("MaxProfit","max_profit_pct",11),("MaxAdverse","max_adverse_pct",12),
+        ("Would've Won?","would_have_won",14),
+        ("Reasons","blocked_reasons",50),
+    ]
+    for c,(h,_,w) in enumerate(bcols):
+        ws6.set_column(c,c,w); ws6.write(2,c,h,hdr)
+
+    if blocked_log:
+        for r, row in enumerate(reversed(blocked_log[-300:]), start=3):
+            primary = row.get("blocked_by","")
+            wwon    = row.get("would_have_won")
+            if wwon is True:   rf = loss_f   # blocked a winner — highlight red
+            elif wwon is False: rf = win_f   # correctly blocked a loser — highlight green
+            else:               rf = open_f  # not yet evaluated
+            for c,(_,col,_) in enumerate(bcols):
+                val = row.get(col,"")
+                if isinstance(val, list): val = " | ".join(str(v) for v in val)
+                if val is None: val = "-"
+                if col == "would_have_won":
+                    val = "✅ YES — missed winner" if wwon is True else ("❌ NO — good block" if wwon is False else "⏳ pending")
+                ws6.write(r, c, val, rf)
+    else:
+        ws6.write(3, 0, "No blocked signals yet — populates automatically as scanner runs", ylw)
+
+    # ── Per-filter summary table at the top right ─────────────────────
+    ws6.write(0, 5, "Per-Filter Breakdown", subhdr)
+    fh = ["Filter","Blocked","Evaluated","Would've Won","Missed Win Rate","Verdict"]
+    for c,h in enumerate(fh): ws6.write(2, c+5, h, hdr)
+
+    filter_keys = ["confidence","score","volume","adx","tf_alignment",
+                   "macd","rsi","outside_hours","market_regime","daily_bias","news"]
+    evaluated_all = [b for b in blocked_log if b.get("would_have_won") is not None]
+
+    for fi, fk in enumerate(filter_keys):
+        bf  = [b for b in blocked_log if b.get("blocked_by") == fk]
+        ev  = [b for b in bf if b.get("would_have_won") is not None]
+        ww  = sum(1 for b in ev if b.get("would_have_won"))
+        mwr = round(ww/max(len(ev),1)*100,1) if ev else 0
+        verd = ("⚠️ Relax?" if mwr >= 60 else ("🟡 Monitor" if mwr >= 45 else "✅ Good")) if len(ev)>=5 else "⏳ pending"
+        rf2 = loss_f if mwr >= 60 else (ylw if mwr >= 45 else win_f)
+        row_data = [fk, len(bf), len(ev), ww, f"{mwr}%", verd]
+        for c, v in enumerate(row_data):
+            ws6.write(3+fi, c+5, v, rf2)
+
+    # ── Sheet 7: Grade Analysis ───────────────────────────────────────
+    ws7 = wb.add_worksheet("🔬 Grade Analysis"); ws7.set_tab_color("#B963D4"); ws7.freeze_panes(4,0)
+    ws7.set_column("A:A", 22); ws7.set_column("B:Z", 14)
+    ws7.write(0, 0, "📊 A / B / C Grade Performance — Filter Optimisation Journal", title)
+    ws7.write(1, 0, f"Generated: {now_str}", neu)
+    ws7.write(2, 0, "A-Grade: Conf≥70 Score≥11 ADX≥25 Vol≥1.0x All3TF", subhdr)
+    ws7.write(2, 3, "B-Grade: Conf≥55 Score≥9 ADX≥20 Vol≥0.8x 2/3TF", subhdr)
+    ws7.write(2, 6, "C-Grade: Everything else (directional signals)", subhdr)
+
+    gh = ["Grade","Total","Open","Closed","Wins","Losses","Expired",
+          "Win Rate","Avg Profit","Avg Win","Avg Loss","Total PnL",
+          "Avg PnL@1h","Avg PnL@4h","Avg PnL@24h","Avg MaxProfit","Avg MaxDD"]
+    for c, h in enumerate(gh):
+        ws7.write(3, c, h, hdr)
+
+    directional_all = [s for s in signal_log if s.get("signal") in ("BUY","SELL")]
+    for gi, grade in enumerate(["A","B","C"]):
+        gs = _grade_stats(directional_all, grade)
+        grade_fmt = win_f if grade == "A" else (open_f if grade == "B" else exp_f)
+        row_vals = [
+            gs["grade"], gs["total"], gs["open"], gs["closed"],
+            gs["wins"], gs["losses"], gs["expired"],
+            gs["win_rate"], gs["avg_profit"], gs["avg_win"], gs["avg_loss"], gs["total_pnl"],
+            gs["avg_pnl_1h"], gs["avg_pnl_4h"], gs["avg_pnl_24h"],
+            gs["avg_max_profit"], gs["avg_max_drawdown"],
+        ]
+        for c, v in enumerate(row_vals):
+            ws7.write(4 + gi, c, v, grade_fmt)
+
+    # Signal-by-signal journal table
+    jcols = [
+        ("Time","time_utc",8),("Symbol","symbol",10),("Dir","signal",6),("Grade","grade",6),
+        ("Conf","confidence",9),("Score","score",8),("ADX","adx",7),("Vol","vol_ratio",7),
+        ("15m","tf_15m",6),("1h","tf_1h",6),("4h","tf_4h",6),("Allowed?","trade_allowed",10),
+        ("Entry","entry_price",13),("SL","stop_loss",13),("TP","take_profit",13),
+        ("PnL%","pnl_pct",9),("@1h%","pnl_1h",9),("@4h%","pnl_4h",9),("@24h%","pnl_24h",9),
+        ("MaxProfit","max_profit_pct",11),("MaxDD","max_drawdown_pct",11),
+        ("Outcome","outcome",9),("Status","status",9),
+    ]
+    jstart = 9
+    ws7.write(jstart - 1, 0, "── Full Signal Journal ──", subhdr)
+    for c, (h, _, w) in enumerate(jcols):
+        ws7.set_column(c, c, w); ws7.write(jstart, c, h, hdr)
+
+    if directional_all:
+        for r, row in enumerate(reversed(directional_all[-200:]), start=jstart+1):
+            rf = rfmt(row.get("status","-"))
+            allowed_f = grn if row.get("trade_allowed") == "YES" else red
+            for c, (_, col, _) in enumerate(jcols):
+                val = row.get(col, "")
+                if val is None: val = "-"
+                use_f = allowed_f if col == "trade_allowed" else rf
+                ws7.write(r, c, val, use_f)
+    else:
+        ws7.write(jstart + 1, 0, "No signals logged yet — journal fills automatically", ylw)
+
     wb.close()
     buf.seek(0)
     return buf.read()
@@ -820,15 +1285,30 @@ async def background_scanner():
         for symbol in PAIRS:
             try:
                 sig = compute_signal(symbol)
-                # Auto-log signal if it passes all filters
-                if passes_filters(sig):
-                    log_signal_entry(sig)
+                signal = sig.get("signal", "HOLD")
+
+                if signal != "HOLD":
+                    grade = grade_signal(sig)
+                    passed, reasons = passes_filters_detail(sig)
+
+                    if passed:
+                        # Signal cleared all filters — log to main journal
+                        log_signal_entry(sig, force_grade=grade)
+                    else:
+                        # Signal was blocked — log exactly why
+                        log_blocked_signal(sig, reasons)
+                        # Still log to journal with trade_allowed=NO so
+                        # the A/B/C grade comparison captures it
+                        log_signal_entry(sig, force_grade=grade)
+
             except Exception as e:
                 print(f"[Scanner] {symbol} error: {e}")
             await asyncio.sleep(3)
-        # Update open signal outcomes every scan cycle
+
+        # Update outcomes for both allowed and blocked signals
         try:
             update_signal_outcomes()
+            update_blocked_outcomes()
         except Exception as e:
             print(f"[Outcome updater] {e}")
         await asyncio.sleep(300)
@@ -942,6 +1422,200 @@ def clear_signal_log():
     signal_log = []
     save_signal_log(signal_log)
     return {"status": "Signal log cleared"}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TRADE JOURNAL — Grade Performance Analysis
+# ══════════════════════════════════════════════════════════════════════
+
+def _grade_stats(signals: list, grade: str) -> dict:
+    """Compute win rate and avg profit for a single grade bucket."""
+    bucket = [s for s in signals if s.get("grade") == grade]
+    closed = [s for s in bucket if s["status"] == "CLOSED"]
+    wins   = [s for s in closed if s["outcome"] == "WIN"]
+    losses = [s for s in closed if s["outcome"] == "LOSS"]
+    pnls   = [s["pnl_pct"] for s in closed if s["pnl_pct"] is not None]
+
+    win_rate   = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
+    avg_profit = round(sum(pnls) / len(pnls), 2) if pnls else 0
+    avg_win    = round(sum(s["pnl_pct"] for s in wins if s["pnl_pct"] is not None)
+                       / max(len(wins), 1), 2) if wins else 0
+    avg_loss   = round(sum(s["pnl_pct"] for s in losses if s["pnl_pct"] is not None)
+                       / max(len(losses), 1), 2) if losses else 0
+
+    return {
+        "grade":        grade,
+        "total":        len(bucket),
+        "open":         len(bucket) - len(closed),
+        "closed":       len(closed),
+        "wins":         len(wins),
+        "losses":       len(losses),
+        "expired":      sum(1 for s in closed if s["outcome"] == "EXPIRED"),
+        "win_rate":     f"{win_rate}%",
+        "avg_profit":   f"{avg_profit:+.2f}%",
+        "avg_win":      f"{avg_win:+.2f}%",
+        "avg_loss":     f"{avg_loss:+.2f}%",
+        "total_pnl":    f"{round(sum(pnls), 2):+.2f}%",
+        # Snapshot averages — how the trade looked at 1h/4h/24h
+        "avg_pnl_1h":   f"{round(sum(s['pnl_1h'] for s in bucket if s.get('pnl_1h') is not None) / max(sum(1 for s in bucket if s.get('pnl_1h') is not None), 1), 2):+.2f}%",
+        "avg_pnl_4h":   f"{round(sum(s['pnl_4h'] for s in bucket if s.get('pnl_4h') is not None) / max(sum(1 for s in bucket if s.get('pnl_4h') is not None), 1), 2):+.2f}%",
+        "avg_pnl_24h":  f"{round(sum(s['pnl_24h'] for s in bucket if s.get('pnl_24h') is not None) / max(sum(1 for s in bucket if s.get('pnl_24h') is not None), 1), 2):+.2f}%",
+        "avg_max_profit":   f"{round(sum(s['max_profit_pct'] for s in bucket if s.get('max_profit_pct') is not None) / max(sum(1 for s in bucket if s.get('max_profit_pct') is not None), 1), 2):+.2f}%",
+        "avg_max_drawdown": f"{round(sum(s['max_drawdown_pct'] for s in bucket if s.get('max_drawdown_pct') is not None) / max(sum(1 for s in bucket if s.get('max_drawdown_pct') is not None), 1), 2):+.2f}%",
+        "thresholds": (
+            "Conf≥70 Score≥11 ADX≥25 Vol≥1.0x All 3TF" if grade == "A" else
+            "Conf≥55 Score≥9  ADX≥20 Vol≥0.8x 2/3 TF"  if grade == "B" else
+            "Everything else (directional signals only)"
+        ),
+    }
+
+
+@app.get("/journal/grade-stats")
+def journal_grade_stats():
+    """
+    Returns A/B/C grade performance comparison.
+    After 50-100 signals this tells you which filter tier is most profitable.
+    """
+    update_signal_outcomes()
+    directional = [s for s in signal_log if s.get("signal") in ("BUY", "SELL")]
+    return {
+        "total_signals":     len(directional),
+        "summary":           (
+            f"{len(directional)} directional signals logged — "
+            f"{sum(1 for s in directional if s.get('grade')=='A')} A-grade, "
+            f"{sum(1 for s in directional if s.get('grade')=='B')} B-grade, "
+            f"{sum(1 for s in directional if s.get('grade')=='C')} C-grade"
+        ),
+        "grades": {
+            "A": _grade_stats(directional, "A"),
+            "B": _grade_stats(directional, "B"),
+            "C": _grade_stats(directional, "C"),
+        },
+        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+@app.get("/journal/signals")
+def journal_signals(grade: str = None, limit: int = 100):
+    """
+    Returns the raw signal journal, optionally filtered by grade (A/B/C).
+    Includes all filter values at signal time + outcome snapshots.
+    GET /journal/signals?grade=B&limit=50
+    """
+    update_signal_outcomes()
+    sigs = signal_log
+    if grade:
+        sigs = [s for s in sigs if s.get("grade", "").upper() == grade.upper()]
+    return {
+        "count":   len(sigs),
+        "signals": sigs[-limit:],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCKED SIGNALS — Which filters are rejecting profitable trades?
+# ══════════════════════════════════════════════════════════════════════
+
+@app.get("/blocked/log")
+def get_blocked_log(limit: int = 50):
+    """Returns the most recent blocked signals with reasons."""
+    update_blocked_outcomes()
+    return {
+        "total_blocked": len(blocked_log),
+        "signals":       blocked_log[-limit:],
+    }
+
+
+@app.get("/blocked/stats")
+def get_blocked_stats():
+    """
+    The key analysis endpoint.
+    For each filter, shows:
+      - How many signals it blocked
+      - Of those, how many would have WON (based on 24h price action)
+      - Win rate of signals it blocked
+    After 50+ blocked signals this answers: 'which filter is costing me money?'
+    """
+    update_blocked_outcomes()
+
+    if not blocked_log:
+        return {"message": "No blocked signals yet — scanner will populate this over time."}
+
+    # ── Per-filter breakdown ──────────────────────────────────────────
+    filters = ["confidence", "score", "volume", "adx", "tf_alignment",
+               "macd", "rsi", "outside_hours", "market_regime",
+               "daily_bias", "orderbook", "news", "other"]
+
+    stats = {}
+    for f in filters:
+        blocked_by_f = [b for b in blocked_log if b.get("blocked_by") == f]
+        evaluated    = [b for b in blocked_by_f if b.get("would_have_won") is not None]
+        would_win    = [b for b in evaluated if b.get("would_have_won") is True]
+        would_lose   = [b for b in evaluated if b.get("would_have_won") is False]
+
+        if not blocked_by_f:
+            continue
+
+        avg_move_1h  = _avg(b.get("move_1h_pct") for b in blocked_by_f if b.get("move_1h_pct") is not None)
+        avg_move_24h = _avg(b.get("move_24h_pct") for b in blocked_by_f if b.get("move_24h_pct") is not None)
+
+        stats[f] = {
+            "filter":            f,
+            "total_blocked":     len(blocked_by_f),
+            "evaluated":         len(evaluated),
+            "would_have_won":    len(would_win),
+            "would_have_lost":   len(would_lose),
+            "missed_win_rate":   f"{round(len(would_win) / max(len(evaluated), 1) * 100, 1)}%",
+            "avg_move_1h":       f"{avg_move_1h:+.2f}%" if avg_move_1h is not None else "n/a",
+            "avg_move_24h":      f"{avg_move_24h:+.2f}%" if avg_move_24h is not None else "n/a",
+            "verdict":           _filter_verdict(f, len(would_win), len(evaluated)),
+        }
+
+    # ── Overall summary ───────────────────────────────────────────────
+    evaluated_all  = [b for b in blocked_log if b.get("would_have_won") is not None]
+    missed_wins    = sum(1 for b in evaluated_all if b["would_have_won"])
+    total_blocked  = len(blocked_log)
+
+    return {
+        "total_blocked":   total_blocked,
+        "evaluated":       len(evaluated_all),
+        "missed_wins":     missed_wins,
+        "missed_win_rate": f"{round(missed_wins / max(len(evaluated_all), 1) * 100, 1)}%",
+        "summary": (
+            f"Of {len(evaluated_all)} evaluated blocked signals, "
+            f"{missed_wins} ({round(missed_wins/max(len(evaluated_all),1)*100,1)}%) "
+            f"would have been winners. Filters with high missed-win-rate are candidates to relax."
+        ),
+        "by_filter":       stats,
+        "last_updated":    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+def _avg(values) -> float | None:
+    vals = list(values)
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
+def _filter_verdict(filter_name: str, would_win: int, evaluated: int) -> str:
+    if evaluated < 5:
+        return "⏳ Not enough data yet"
+    rate = would_win / evaluated
+    if rate >= 0.6:
+        return f"⚠️ HIGH missed-win rate ({rate*100:.0f}%) — consider relaxing this filter"
+    if rate >= 0.45:
+        return f"🟡 Moderate missed-win rate ({rate*100:.0f}%) — worth monitoring"
+    return f"✅ Blocking correctly ({rate*100:.0f}% would have won — good filter)"
+
+
+@app.delete("/blocked/clear")
+def clear_blocked_log():
+    """Clear blocked signals log (use carefully)."""
+    global blocked_log
+    blocked_log = []
+    save_blocked_log(blocked_log)
+    return {"status": "Blocked signals log cleared"}
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════
