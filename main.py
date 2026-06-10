@@ -350,10 +350,14 @@ def compute_signal(symbol: str) -> dict:
     price   = main["price"]
     atr_val = main["atr"]
 
-    if final_signal == "BUY":
+    # Use the actual directional signal for SL/TP calculation
+    # even if final_signal was overridden to HOLD by news/regime/bias block
+    sl_tp_signal = final_signal if final_signal != "HOLD" else main.get("signal", "HOLD")
+
+    if sl_tp_signal == "BUY":
         stop_loss   = round(price - (atr_val * 2.0), 4)
         take_profit = round(price + (atr_val * 4.0), 4)
-    elif final_signal == "SELL":
+    elif sl_tp_signal == "SELL":
         stop_loss   = round(price + (atr_val * 2.0), 4)
         take_profit = round(price - (atr_val * 4.0), 4)
     else:
@@ -810,6 +814,11 @@ def update_signal_outcomes():
         sl         = sig["stop_loss"]
         tp         = sig["take_profit"]
         entry      = sig["entry_price"]
+
+        # Skip outcome tracking if SL/TP/entry are missing or zero
+        if not sl or not tp or not entry or sl == 0 or tp == 0:
+            continue
+
         logged_at  = datetime.fromisoformat(sig["logged_at"])
         now_utc    = datetime.now(timezone.utc)
         hours_open = round((now_utc - logged_at).total_seconds() / 3600, 1)
