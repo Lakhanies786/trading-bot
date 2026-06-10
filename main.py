@@ -940,6 +940,7 @@ def update_blocked_outcomes():
         save_blocked_log(blocked_log)
 
 
+def generate_excel_bytes() -> bytes:
     import xlsxwriter
     import pandas as pd
 
