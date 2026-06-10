@@ -373,6 +373,10 @@ def compute_signal(symbol: str) -> dict:
     result = {
         "symbol":             symbol,
         "signal":             final_signal,
+        "pre_block_signal":   main.get("signal", "HOLD"),  # original direction before any block
+        "news_blocked":       news_blocked,
+        "regime_blocked":     regime_blocked,
+        "bias_blocked":       bias_blocked,
         "confidence":         main.get("confidence", "0%"),
         "mtf_confidence":     mtf_confidence,
         "agreement":          final_strength,
@@ -1286,27 +1290,43 @@ async def background_scanner():
         for symbol in PAIRS:
             try:
                 sig = compute_signal(symbol)
-                signal = sig.get("signal", "HOLD")
+                signal         = sig.get("signal", "HOLD")
+                pre_block      = sig.get("pre_block_signal", "HOLD")
+                news_blocked   = sig.get("news_blocked", False)
+                regime_blocked = sig.get("regime_blocked", False)
+                bias_blocked   = sig.get("bias_blocked", False)
 
+                # Case 1 — signal passed all upstream gates, now check hard filters
                 if signal != "HOLD":
                     grade = grade_signal(sig)
                     passed, reasons = passes_filters_detail(sig)
-
                     if passed:
-                        # Signal cleared all filters — log to main journal
                         log_signal_entry(sig, force_grade=grade)
                     else:
-                        # Signal was blocked — log exactly why
                         log_blocked_signal(sig, reasons)
-                        # Still log to journal with trade_allowed=NO so
-                        # the A/B/C grade comparison captures it
                         log_signal_entry(sig, force_grade=grade)
+
+                # Case 2 — signal was blocked upstream (news/regime/bias)
+                # pre_block_signal tells us what direction it would have been
+                elif pre_block != "HOLD":
+                    # Build a pseudo-sig with the original direction for logging
+                    pseudo_sig = {**sig, "signal": pre_block}
+                    grade = grade_signal(pseudo_sig)
+                    reasons = []
+                    if news_blocked:
+                        reasons.append(f"News block: {sig.get('news_reason', 'high-impact event')}")
+                    if regime_blocked:
+                        reasons.append(f"Market regime blocked: {sig.get('regime_reason', 'UNKNOWN')}")
+                    if bias_blocked:
+                        reasons.append(f"Daily bias {sig.get('daily_bias','?')} blocks {pre_block}")
+                    if reasons:
+                        log_blocked_signal(pseudo_sig, reasons)
+                        log_signal_entry(pseudo_sig, force_grade=grade)
 
             except Exception as e:
                 print(f"[Scanner] {symbol} error: {e}")
             await asyncio.sleep(3)
 
-        # Update outcomes for both allowed and blocked signals
         try:
             update_signal_outcomes()
             update_blocked_outcomes()
