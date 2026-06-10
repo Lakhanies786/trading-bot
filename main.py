@@ -954,7 +954,7 @@ def generate_excel_bytes() -> bytes:
     buf = io.BytesIO()
     df  = pd.DataFrame(signals) if signals else pd.DataFrame()
 
-    wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True, "nan_inf_to_errors": True})
 
     title  = wb.add_format({"bold":True,"font_size":13,"font_color":"#58A6FF","bg_color":"#0D1117"})
     hdr    = wb.add_format({"bold":True,"bg_color":"#161B22","font_color":"#FFFFFF","border":1,"align":"center"})
