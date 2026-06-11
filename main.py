@@ -1294,7 +1294,20 @@ def update_blocked_outcomes():
         save_blocked_log(blocked_log)
 
 
-def generate_excel_bytes() -> bytes:
+
+class _NullWs:
+    """Absorbs all worksheet calls when a sheet is skipped (wrong mode)."""
+    def write(self, *a, **kw): pass
+    def set_tab_color(self, *a, **kw): pass
+    def freeze_panes(self, *a, **kw): pass
+    def set_column(self, *a, **kw): pass
+    def set_row(self, *a, **kw): pass
+    def merge_range(self, *a, **kw): pass
+    def autofilter(self, *a, **kw): pass
+    def conditional_format(self, *a, **kw): pass
+_NULL_WS = _NullWs()
+
+def generate_excel_bytes(mode: str = "swing") -> bytes:
     import xlsxwriter
     import pandas as pd
 
@@ -1323,8 +1336,9 @@ def generate_excel_bytes() -> bytes:
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # ── Sheet 1: All Signals ─────────────────────────────────────────
-    ws1 = wb.add_worksheet("All Signals"); ws1.set_tab_color("#58A6FF"); ws1.freeze_panes(3,0)
+    # ── Sheet 1: All Signals (swing only) ───────────────────────────
+    ws1 = wb.add_worksheet("All Signals") if mode == "swing" else _NULL_WS
+    ws1.set_tab_color("#58A6FF"); ws1.freeze_panes(3,0)
     ws1.write(0,0,f"MEXC Bot — All Signals Tracker  ({now_str})",title)
 
     cols = [
@@ -1365,7 +1379,7 @@ def generate_excel_bytes() -> bytes:
         ws1.write(3,0,"No signals logged yet — signals appear here automatically",ylw)
 
     # ── Sheet 2: Open Signals ─────────────────────────────────────────
-    ws2 = wb.add_worksheet("🟡 Open Signals"); ws2.set_tab_color("#F0B429"); ws2.freeze_panes(3,0)
+    ws2 = wb.add_worksheet("🟡 Open Signals") if mode == "swing" else _NULL_WS; ws2.set_tab_color("#F0B429"); ws2.freeze_panes(3,0)
     open_df = df[df["status"]=="OPEN"] if not df.empty and "status" in df.columns else pd.DataFrame()
     ws2.write(0,0,f"Currently Open — {len(open_df)} signals being tracked  ({now_str})",title)
     ocols = [("Date","date",10),("Time","time_utc",8),("Symbol","symbol",10),
@@ -1386,7 +1400,7 @@ def generate_excel_bytes() -> bytes:
                 ws2.write(r,c,val,open_f)
 
     # ── Sheet 3: Daily Summary ────────────────────────────────────────
-    ws3 = wb.add_worksheet("Daily Summary"); ws3.set_tab_color("#3FB950"); ws3.freeze_panes(3,0)
+    ws3 = wb.add_worksheet("Daily Summary") if mode == "swing" else _NULL_WS; ws3.set_tab_color("#3FB950"); ws3.freeze_panes(3,0)
     ws3.write(0,0,"Daily Signal Performance",title)
     dh=["Date","Total","Wins","Losses","Expired","Open","Win Rate %","Total PnL %","Best %","Worst %"]
     for c,h in enumerate(dh): ws3.set_column(c,c,13); ws3.write(2,c,h,hdr)
@@ -1416,7 +1430,7 @@ def generate_excel_bytes() -> bytes:
         ws3.write(3,0,"No data yet",ylw)
 
     # ── Sheet 4: By Symbol ────────────────────────────────────────────
-    ws4 = wb.add_worksheet("By Symbol"); ws4.set_tab_color("#F85149"); ws4.freeze_panes(3,0)
+    ws4 = wb.add_worksheet("By Symbol") if mode == "swing" else _NULL_WS; ws4.set_tab_color("#F85149"); ws4.freeze_panes(3,0)
     ws4.write(0,0,"Signal Performance by Symbol",title)
     sh=["Symbol","Total","Wins","Losses","Win Rate","Total PnL %","Avg Win %","Avg Loss %","Best","Worst"]
     for c,h in enumerate(sh): ws4.set_column(c,c,13); ws4.write(2,c,h,hdr)
@@ -1441,7 +1455,7 @@ def generate_excel_bytes() -> bytes:
         ws4.write(3,0,"No data yet",ylw)
 
     # ── Sheet 5: Dashboard ────────────────────────────────────────────
-    ws5 = wb.add_worksheet("📊 Dashboard"); ws5.set_tab_color("#58A6FF")
+    ws5 = wb.add_worksheet("📊 Dashboard") if mode == "swing" else _NULL_WS; ws5.set_tab_color("#58A6FF")
     ws5.set_column("A:A",35); ws5.set_column("B:B",30)
     ws5.write(0,0,"📊 MEXC Bot — Live Signal Tracker Dashboard",title)
     ws5.write(1,0,f"Generated: {now_str}",neu)
@@ -1515,7 +1529,7 @@ def generate_excel_bytes() -> bytes:
         if val!="": ws5.write(r2,1,str(val),vf)
 
     # ── Sheet 6: Blocked Signals ──────────────────────────────────────
-    ws6 = wb.add_worksheet("🚫 Blocked Signals"); ws6.set_tab_color("#F85149"); ws6.freeze_panes(3,0)
+    ws6 = wb.add_worksheet("🚫 Blocked Signals") if mode == "swing" else _NULL_WS; ws6.set_tab_color("#F85149"); ws6.freeze_panes(3,0)
     ws6.write(0, 0, f"Blocked Signals — What the Bot Rejected & Why  ({now_str})", title)
     ws6.write(1, 0, "HIGH missed-win rate on a filter = consider relaxing it", ylw)
 
@@ -1574,7 +1588,7 @@ def generate_excel_bytes() -> bytes:
             ws6.write(3+fi, c+5, v, rf2)
 
     # ── Sheet 7: Grade Analysis ───────────────────────────────────────
-    ws7 = wb.add_worksheet("🔬 Grade Analysis"); ws7.set_tab_color("#B963D4"); ws7.freeze_panes(4,0)
+    ws7 = wb.add_worksheet("🔬 Grade Analysis") if mode == "swing" else _NULL_WS; ws7.set_tab_color("#B963D4"); ws7.freeze_panes(4,0)
     ws7.set_column("A:A", 22); ws7.set_column("B:Z", 14)
     ws7.write(0, 0, "📊 A / B / C Grade Performance — Filter Optimisation Journal", title)
     ws7.write(1, 0, f"Generated: {now_str}", neu)
@@ -1630,7 +1644,7 @@ def generate_excel_bytes() -> bytes:
         ws7.write(jstart + 1, 0, "No signals logged yet — journal fills automatically", ylw)
 
     # ── Sheet 8: Scalp Signals ────────────────────────────────────────
-    ws8 = wb.add_worksheet("⚡ Scalp Signals"); ws8.set_tab_color("#F0B429"); ws8.freeze_panes(3,0)
+    ws8 = wb.add_worksheet("⚡ Scalp Signals") if mode == "scalp" else _NULL_WS; ws8.set_tab_color("#F0B429"); ws8.freeze_panes(3,0)
     ws8.write(0, 0, f"⚡ Scalp Signals (1m+5m+15m)  •  Stricter Filters  •  {now_str}", title)
     ws8.write(1, 0, f"Filters: Conf≥{SCALP_MIN_CONFIDENCE}% Score≥{SCALP_MIN_SCORE} ADX≥{SCALP_ADX_MIN} Vol≥{SCALP_MIN_VOL_RATIO}x  All 3 TF must agree  •  SL=ATR×1 TP=ATR×2", neu)
 
@@ -1662,7 +1676,7 @@ def generate_excel_bytes() -> bytes:
         ws8.write(3, 0, "No scalp signals yet — scanner populates automatically", ylw)
 
     # ── Sheet 9: Scalp Blocked ────────────────────────────────────────
-    ws9 = wb.add_worksheet("⚡🚫 Scalp Blocked"); ws9.set_tab_color("#FF6B6B"); ws9.freeze_panes(3,0)
+    ws9 = wb.add_worksheet("⚡🚫 Scalp Blocked") if mode == "scalp" else _NULL_WS; ws9.set_tab_color("#FF6B6B"); ws9.freeze_panes(3,0)
     ws9.write(0, 0, f"Scalp Blocked Signals — What Was Rejected & Why  ({now_str})", title)
 
     sbcols = [
@@ -1693,7 +1707,7 @@ def generate_excel_bytes() -> bytes:
         ws9.write(3, 0, "No scalp blocked signals yet", ylw)
 
     # ── Sheet 10: Scalp Stats ─────────────────────────────────────────
-    ws10 = wb.add_worksheet("⚡📊 Scalp Stats"); ws10.set_tab_color("#58A6FF")
+    ws10 = wb.add_worksheet("⚡📊 Scalp Stats") if mode == "scalp" else _NULL_WS; ws10.set_tab_color("#58A6FF")
     ws10.write(0, 0, f"Scalp Performance Summary  ({now_str})", title)
     ws10.set_column("A:A", 28); ws10.set_column("B:B", 16)
 
@@ -2047,7 +2061,7 @@ def _grade_stats(signals: list, grade: str) -> dict:
 @app.get("/journal/grade-stats")
 def journal_grade_stats():
     """
-    Returns A/B/C grade performance comparison for SWING signals.
+    Returns A/B/C grade performance comparison.
     After 50-100 signals this tells you which filter tier is most profitable.
     """
     update_signal_outcomes()
@@ -2056,31 +2070,6 @@ def journal_grade_stats():
         "total_signals":     len(directional),
         "summary":           (
             f"{len(directional)} directional signals logged — "
-            f"{sum(1 for s in directional if s.get('grade')=='A')} A-grade, "
-            f"{sum(1 for s in directional if s.get('grade')=='B')} B-grade, "
-            f"{sum(1 for s in directional if s.get('grade')=='C')} C-grade"
-        ),
-        "grades": {
-            "A": _grade_stats(directional, "A"),
-            "B": _grade_stats(directional, "B"),
-            "C": _grade_stats(directional, "C"),
-        },
-        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-    }
-
-
-@app.get("/scalp/grade-stats")
-def scalp_grade_stats():
-    """
-    Returns A/B/C grade performance comparison for SCALP signals only.
-    Separate from swing — scalp uses 1m+5m+15m, different thresholds.
-    """
-    update_scalp_outcomes()
-    directional = [s for s in scalp_log if s.get("signal") in ("BUY", "SELL")]
-    return {
-        "total_signals":     len(directional),
-        "summary":           (
-            f"{len(directional)} scalp signals logged — "
             f"{sum(1 for s in directional if s.get('grade')=='A')} A-grade, "
             f"{sum(1 for s in directional if s.get('grade')=='B')} B-grade, "
             f"{sum(1 for s in directional if s.get('grade')=='C')} C-grade"
@@ -2224,23 +2213,38 @@ def clear_blocked_log():
 @app.get("/signals/download")
 def download_signal_report():
     """
-    Returns Excel file as download.
-    Android app calls this URL — user taps Download Report button.
-    Contains: All Signals, Open Signals, Daily Summary, By Symbol, Dashboard
+    Swing signal report — All Signals, Open, Daily Summary, By Symbol,
+    Dashboard, Blocked Signals, Grade Analysis sheets.
     """
     try:
-        excel_bytes = generate_excel_bytes()
-        filename    = f"signal_report_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.xlsx"
+        excel_bytes = generate_excel_bytes(mode="swing")
+        filename    = f"swing_report_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.xlsx"
         return StreamingResponse(
             io.BytesIO(excel_bytes),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
     except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail="xlsxwriter not installed. Run: pip install xlsxwriter"
+        raise HTTPException(status_code=500, detail="xlsxwriter not installed. Run: pip install xlsxwriter")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/scalp/download")
+def download_scalp_report():
+    """
+    Scalp signal report — Scalp Signals, Scalp Blocked, Scalp Stats sheets only.
+    """
+    try:
+        excel_bytes = generate_excel_bytes(mode="scalp")
+        filename    = f"scalp_report_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.xlsx"
+        return StreamingResponse(
+            io.BytesIO(excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
+    except ImportError:
+        raise HTTPException(status_code=500, detail="xlsxwriter not installed. Run: pip install xlsxwriter")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
