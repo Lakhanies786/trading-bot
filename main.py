@@ -18,6 +18,14 @@ MIN_CONFIDENCE   = 50      # Lowered from 70 — testing phase (was filtering to
 MIN_SCORE        = 10      # Lowered from 11 — testing phase
 MIN_VOL_RATIO    = 0.8     # Lowered from 1.0 — testing phase
 ADX_MIN          = 20      # Lowered from 25 — most ETH/BTC signals were 20-24 and got rejected
+
+# ── Scalping Filter Constants (stricter — higher accuracy needed) ──────
+SCALP_MIN_CONFIDENCE = 65   # higher bar — scalp signals must be high conviction
+SCALP_MIN_SCORE      = 12   # stricter score
+SCALP_MIN_VOL_RATIO  = 1.2  # volume must confirm move
+SCALP_ADX_MIN        = 22   # trend must be clear
+SCALP_LOG_FILE       = "scalp_signal_log.json"
+SCALP_BLOCKED_FILE   = "scalp_blocked_log.json"
 TRADE_HRS_UTC    = (8, 17) # UTC trading hours
 REQUIRE_4H       = True
 MAX_SIGNAL_AGE   = 24
@@ -62,6 +70,28 @@ def save_blocked_log(blocked: list):
         json.dump(blocked, f, indent=2)
 
 blocked_log: list = load_blocked_log()
+
+# ── Scalp logs ────────────────────────────────────────────────────────
+def load_scalp_log() -> list:
+    if not Path(SCALP_LOG_FILE).exists(): return []
+    try:
+        with open(SCALP_LOG_FILE) as f: return json.load(f)
+    except: return []
+
+def save_scalp_log(signals: list):
+    with open(SCALP_LOG_FILE, "w") as f: json.dump(signals, f, indent=2)
+
+def load_scalp_blocked() -> list:
+    if not Path(SCALP_BLOCKED_FILE).exists(): return []
+    try:
+        with open(SCALP_BLOCKED_FILE) as f: return json.load(f)
+    except: return []
+
+def save_scalp_blocked(blocked: list):
+    with open(SCALP_BLOCKED_FILE, "w") as f: json.dump(blocked, f, indent=2)
+
+scalp_log:     list = load_scalp_log()
+scalp_blocked: list = load_scalp_blocked()
 
 signal_log: list = load_signal_log()
 
@@ -355,11 +385,11 @@ def compute_signal(symbol: str) -> dict:
     sl_tp_signal = final_signal if final_signal != "HOLD" else main.get("signal", "HOLD")
 
     if sl_tp_signal == "BUY":
-        stop_loss   = round(price - (atr_val * 2.0), 4)
-        take_profit = round(price + (atr_val * 4.0), 4)
+        stop_loss   = round(price - (atr_val * 2.5), 4)
+        take_profit = round(price + (atr_val * 5.0), 4)
     elif sl_tp_signal == "SELL":
-        stop_loss   = round(price + (atr_val * 2.0), 4)
-        take_profit = round(price - (atr_val * 4.0), 4)
+        stop_loss   = round(price + (atr_val * 2.5), 4)
+        take_profit = round(price - (atr_val * 5.0), 4)
     else:
         stop_loss   = None
         take_profit = None
@@ -474,6 +504,133 @@ def compute_signal(symbol: str) -> dict:
 
 
 # ── Signal log helpers ────────────────────────────────────────────────
+
+def compute_scalp_signal(symbol: str) -> dict:
+    """
+    Scalping signal using 1m + 5m + 15m timeframes.
+    Tighter SL/TP (ATR×1.0 / ATR×2.0) and stricter filters than swing.
+    All 3 timeframes must agree for a valid scalp signal.
+    """
+    from strategy.indicators import prepare_dataframe, add_indicators, generate_signal
+    from strategy.indicators import detect_market_regime
+    from strategy.orderbook  import analyze_orderbook
+
+    spot = get_spot()
+
+    klines_1m  = spot.get_klines(symbol, interval="1m",  limit=100)
+    klines_5m  = spot.get_klines(symbol, interval="5m",  limit=100)
+    klines_15m = spot.get_klines(symbol, interval="15m", limit=100)
+
+    df_1m  = add_indicators(prepare_dataframe(klines_1m))
+    df_5m  = add_indicators(prepare_dataframe(klines_5m))
+    df_15m = add_indicators(prepare_dataframe(klines_15m))
+
+    sig_1m  = generate_signal(df_1m)
+    sig_5m  = generate_signal(df_5m)
+    sig_15m = generate_signal(df_15m)
+
+    regime_info = detect_market_regime(df_5m)
+
+    orderbook   = spot.get_orderbook(symbol, limit=50)
+    ob_analysis = analyze_orderbook(orderbook, sig_5m["price"])
+    ob_signal   = ob_analysis["ob_signal"]
+
+    signals    = [sig_1m["signal"], sig_5m["signal"], sig_15m["signal"]]
+    buy_count  = signals.count("BUY")
+    sell_count = signals.count("SELL")
+
+    if buy_count >= 2:
+        raw_signal    = "BUY"
+        mtf_agreement = f"✅ {buy_count}/3 scalp TF say BUY"
+    elif sell_count >= 2:
+        raw_signal    = "SELL"
+        mtf_agreement = f"✅ {sell_count}/3 scalp TF say SELL"
+    else:
+        raw_signal    = "HOLD"
+        mtf_agreement = "⏳ Scalp TF disagree — wait"
+
+    final_signal = raw_signal
+
+    # Regime gate — block ranging markets for scalping
+    regime_blocked = False
+    if not regime_info["tradeable"] and final_signal != "HOLD":
+        regime_blocked = True
+        final_signal   = "HOLD"
+
+    # News gate
+    news_blocked = False
+    if NEWS_BLOCK_ENABLED and not regime_blocked:
+        from news_filter import check_news_safety
+        news_info = check_news_safety(symbol)
+        if not news_info["safe"]:
+            news_blocked = True
+            final_signal = "HOLD"
+    else:
+        news_info = {"safe": True, "risk_level": "CLEAR", "reason": "",
+                     "sentiment": "UNKNOWN", "news_score": 0}
+
+    # SL/TP — tighter than swing: ATR×1.0 stop, ATR×2.0 target (1:2 R:R)
+    main    = sig_5m
+    price   = main["price"]
+    atr_val = main["atr"]
+    sl_tp_signal = final_signal if final_signal != "HOLD" else raw_signal
+
+    if sl_tp_signal == "BUY":
+        stop_loss   = round(price - (atr_val * 1.0), 4)
+        take_profit = round(price + (atr_val * 2.0), 4)
+    elif sl_tp_signal == "SELL":
+        stop_loss   = round(price + (atr_val * 1.0), 4)
+        take_profit = round(price - (atr_val * 2.0), 4)
+    else:
+        stop_loss = take_profit = None
+
+    risk_reward = "N/A"
+    if stop_loss and take_profit:
+        risk   = abs(price - stop_loss)
+        reward = abs(take_profit - price)
+        risk_reward = f"1:{round(reward/risk, 1)}" if risk > 0 else "1:2"
+
+    conf_pct = main.get("confidence", "0%")
+    conf_num = int(str(conf_pct).replace("%",""))
+    score_str = main.get("score", "0/16")
+    score_num = int(score_str.split("/")[0]) if "/" in score_str else 0
+
+    result = {
+        "mode":               "SCALP",
+        "symbol":             symbol,
+        "signal":             final_signal,
+        "pre_block_signal":   raw_signal,
+        "news_blocked":       news_blocked,
+        "regime_blocked":     regime_blocked,
+        "bias_blocked":       False,
+        "confidence":         conf_pct,
+        "score":              score_str,
+        "adx":                round(main.get("adx") or 0, 2),
+        "vol_ratio":          round(main.get("vol_ratio") or 0, 2),
+        "rsi":                round(main.get("rsi") or 0, 2),
+        "macd_hist":          round(main.get("macd_hist") or 0, 6),
+        "price":              round(price, 6),
+        "stop_loss":          round(stop_loss, 6) if stop_loss else 0,
+        "take_profit":        round(take_profit, 6) if take_profit else 0,
+        "risk_reward":        risk_reward,
+        "atr":                round(atr_val or 0, 6),
+        "vwap":               round(main.get("vwap") or 0, 4),
+        "timeframes": {
+            "1m":  sig_1m["signal"],
+            "5m":  sig_5m["signal"],
+            "15m": sig_15m["signal"],
+        },
+        "ob_signal":          ob_signal,
+        "ob_reasons":         ob_analysis.get("ob_reasons", []),
+        "market_regime":      regime_info.get("regime", "UNKNOWN"),
+        "news_sentiment":     news_info.get("sentiment", "UNKNOWN"),
+        "news_score":         news_info.get("news_score", 0),
+        "news_risk_level":    news_info.get("risk_level", "CLEAR"),
+        "news_safe":          news_info.get("safe", True),
+        "reasons":            [mtf_agreement] + ob_analysis.get("ob_reasons", []) + main.get("reasons", []),
+    }
+    return result
+
 
 def grade_signal(sig: dict) -> str:
     """
@@ -663,6 +820,178 @@ def _primary_blocker(reasons: list[str]) -> str:
         if any(text.lower() in r.lower() for r in reasons):
             return key
     return "other"
+
+
+def passes_scalp_filters(sig: dict) -> tuple[bool, list[str]]:
+    """Stricter filter set for scalp signals."""
+    if sig.get("signal", "HOLD") == "HOLD":
+        return False, ["Signal is HOLD"]
+
+    signal    = sig["signal"]
+    conf      = int(str(sig.get("confidence", "0%")).replace("%", ""))
+    score_num = int(str(sig.get("score", "0/16")).split("/")[0])
+    vol       = sig.get("vol_ratio") or 0
+    adx       = sig.get("adx") or 0
+    tf        = sig.get("timeframes", {})
+    tf_vals   = [tf.get("1m"), tf.get("5m"), tf.get("15m")]
+
+    reasons = []
+    if conf      < SCALP_MIN_CONFIDENCE:
+        reasons.append(f"Confidence {conf}% < {SCALP_MIN_CONFIDENCE}% scalp minimum")
+    if score_num < SCALP_MIN_SCORE:
+        reasons.append(f"Score {score_num}/16 < {SCALP_MIN_SCORE} scalp minimum")
+    if vol       < SCALP_MIN_VOL_RATIO:
+        reasons.append(f"Volume {vol:.2f}x < {SCALP_MIN_VOL_RATIO}x scalp minimum")
+    if adx       < SCALP_ADX_MIN:
+        reasons.append(f"ADX {adx:.1f} < {SCALP_ADX_MIN} scalp minimum")
+    if tf_vals.count(signal) < 3:
+        reasons.append(f"Only {tf_vals.count(signal)}/3 scalp TF agree (need all 3)")
+    if sig.get("news_blocked"):
+        reasons.append(f"News blocked: {sig.get('news_risk_level','?')}")
+    if sig.get("regime_blocked"):
+        reasons.append(f"Market regime blocked")
+
+    return len(reasons) == 0, reasons
+
+
+def log_scalp_signal(sig: dict, passed: bool, reasons: list[str]):
+    """Log scalp signal to scalp_log (if passed) or scalp_blocked (if failed)."""
+    global scalp_log, scalp_blocked
+    signal = sig.get("signal") or sig.get("pre_block_signal", "HOLD")
+    if signal == "HOLD":
+        return
+    now = datetime.now(timezone.utc)
+    tf  = sig.get("timeframes", {})
+
+    entry = {
+        "id":            f"SCALP_{sig.get('symbol','')}_{now.strftime('%Y%m%d_%H%M%S')}",
+        "mode":          "SCALP",
+        "logged_at":     now.isoformat(),
+        "date":          now.strftime("%Y-%m-%d"),
+        "time_utc":      now.strftime("%H:%M"),
+        "symbol":        sig.get("symbol", ""),
+        "signal":        signal,
+        "grade":         grade_signal({**sig, "signal": signal}),
+        "trade_allowed": "YES" if passed else "NO",
+        "blocked_by":    _primary_blocker(reasons) if not passed else "none",
+        "blocked_reasons": reasons if not passed else [],
+        # Filter values
+        "confidence":    sig.get("confidence", "0%"),
+        "score":         sig.get("score", "0/16"),
+        "adx":           round(sig.get("adx") or 0, 2),
+        "vol_ratio":     round(sig.get("vol_ratio") or 0, 2),
+        "rsi":           round(sig.get("rsi") or 0, 2),
+        "tf_1m":         tf.get("1m", "-"),
+        "tf_5m":         tf.get("5m", "-"),
+        "tf_15m":        tf.get("15m", "-"),
+        # Entry/exit
+        "entry_price":   round(sig.get("price", 0), 6),
+        "stop_loss":     round(sig.get("stop_loss") or 0, 6),
+        "take_profit":   round(sig.get("take_profit") or 0, 6),
+        "risk_reward":   sig.get("risk_reward", "N/A"),
+        # Outcome tracking
+        "status":        "OPEN",
+        "outcome":       "-",
+        "exit_price":    None,
+        "exit_time":     None,
+        "pnl_pct":       None,
+        "hours_open":    0,
+        "price_1h":      None,
+        "pnl_1h":        None,
+        "price_4h":      None,
+        "pnl_4h":        None,
+        "max_profit_pct":   None,
+        "max_drawdown_pct": None,
+        "would_have_won":   None,
+        # Context
+        "market_regime":    sig.get("market_regime", "UNKNOWN"),
+        "news_sentiment":   sig.get("news_sentiment", "UNKNOWN"),
+        "ob_signal":        sig.get("ob_signal", "HOLD"),
+    }
+
+    # Deduplicate — skip same symbol+direction in last 15 min for scalp
+    fifteen_ago = (now - timedelta(minutes=15)).isoformat()
+    target_log  = scalp_log if passed else scalp_blocked
+
+    for s in target_log[-100:]:
+        if (s["symbol"] == entry["symbol"] and s["signal"] == signal
+                and s["logged_at"] > fifteen_ago):
+            return
+
+    target_log.append(entry)
+    if len(target_log) > 500:
+        target_log[:] = target_log[-500:]
+
+    if passed:
+        save_scalp_log(scalp_log)
+    else:
+        save_scalp_blocked(scalp_blocked)
+
+
+def update_scalp_outcomes():
+    """Track scalp signal outcomes — same as swing but uses 1h/4h snapshots."""
+    global scalp_log
+    changed = False
+    now_utc = datetime.now(timezone.utc)
+
+    for sig in scalp_log:
+        if sig.get("status") != "OPEN":
+            continue
+        entry = sig.get("entry_price", 0)
+        sl    = sig.get("stop_loss", 0)
+        tp    = sig.get("take_profit", 0)
+        if not entry or not sl or not tp or sl == 0 or tp == 0:
+            continue
+        try:
+            import requests as req
+            r     = req.get(f"https://api.mexc.com/api/v3/ticker/price?symbol={sig['symbol']}", timeout=5)
+            price = float(r.json()["price"])
+        except:
+            continue
+
+        direction  = sig["signal"]
+        logged_at  = datetime.fromisoformat(sig["logged_at"])
+        hours_open = round((now_utc - logged_at).total_seconds() / 3600, 1)
+        sig["hours_open"] = hours_open
+
+        if direction == "BUY":
+            move_pct = round(((price - entry) / entry) * 100, 4)
+        else:
+            move_pct = round(((entry - price) / entry) * 100, 4)
+
+        sig["max_profit_pct"]   = round(max(sig.get("max_profit_pct") or 0, move_pct), 4)
+        sig["max_drawdown_pct"] = round(min(sig.get("max_drawdown_pct") or 0, move_pct), 4)
+
+        if hours_open >= 1 and sig.get("pnl_1h") is None:
+            sig["price_1h"] = round(price, 6); sig["pnl_1h"] = move_pct; changed = True
+        if hours_open >= 4 and sig.get("pnl_4h") is None:
+            sig["price_4h"] = round(price, 6); sig["pnl_4h"] = move_pct; changed = True
+
+        outcome = None; exit_price = None
+        if direction == "BUY":
+            if price <= sl: outcome = "LOSS"; exit_price = sl
+            elif price >= tp: outcome = "WIN";  exit_price = tp
+        else:
+            if price >= sl: outcome = "LOSS"; exit_price = sl
+            elif price <= tp: outcome = "WIN";  exit_price = tp
+
+        # Scalp expires after 4h (not 24h like swing)
+        if not outcome and hours_open >= 4:
+            outcome = "EXPIRED"; exit_price = price
+
+        if outcome:
+            sig["status"]     = "CLOSED"
+            sig["outcome"]    = outcome
+            sig["exit_price"] = round(exit_price, 6)
+            sig["exit_time"]  = now_utc.strftime("%Y-%m-%d %H:%M")
+            if direction == "BUY":
+                sig["pnl_pct"] = round(((exit_price - entry) / entry) * 100, 4)
+            else:
+                sig["pnl_pct"] = round(((entry - exit_price) / entry) * 100, 4)
+            changed = True
+
+    if changed:
+        save_scalp_log(scalp_log)
 
 
 def passes_filters(sig: dict) -> bool:
@@ -1015,7 +1344,10 @@ def generate_excel_bytes() -> bytes:
             rf = rfmt(getattr(row,"status","-"))
             for c,(_,col,_) in enumerate(cols):
                 val = getattr(row,col,"")
-                if val is None: val="-"
+                if val is None: val = "-"
+                # Prevent Excel formula injection and =#NUM! errors
+                if isinstance(val, str) and val.startswith("="):
+                    val = "'" + val  # escape as text
                 ws1.write(r,c,val,rf)
     else:
         ws1.write(3,0,"No signals logged yet — signals appear here automatically",ylw)
@@ -1285,6 +1617,117 @@ def generate_excel_bytes() -> bytes:
     else:
         ws7.write(jstart + 1, 0, "No signals logged yet — journal fills automatically", ylw)
 
+    # ── Sheet 8: Scalp Signals ────────────────────────────────────────
+    ws8 = wb.add_worksheet("⚡ Scalp Signals"); ws8.set_tab_color("#F0B429"); ws8.freeze_panes(3,0)
+    ws8.write(0, 0, f"⚡ Scalp Signals (1m+5m+15m)  •  Stricter Filters  •  {now_str}", title)
+    ws8.write(1, 0, f"Filters: Conf≥{SCALP_MIN_CONFIDENCE}% Score≥{SCALP_MIN_SCORE} ADX≥{SCALP_ADX_MIN} Vol≥{SCALP_MIN_VOL_RATIO}x  All 3 TF must agree  •  SL=ATR×1 TP=ATR×2", neu)
+
+    scols = [
+        ("Date","date",10),("Time","time_utc",8),("Symbol","symbol",10),
+        ("Signal","signal",7),("Grade","grade",7),("Allowed?","trade_allowed",10),
+        ("Conf","confidence",9),("Score","score",8),("ADX","adx",7),("Vol","vol_ratio",7),
+        ("1m","tf_1m",6),("5m","tf_5m",6),("15m","tf_15m",6),
+        ("Entry","entry_price",13),("SL","stop_loss",13),("TP","take_profit",13),("R:R","risk_reward",8),
+        ("RSI","rsi",7),("OB","ob_signal",7),
+        ("Status","status",9),("Outcome","outcome",9),
+        ("PnL%","pnl_pct",9),("@1h%","pnl_1h",9),("@4h%","pnl_4h",9),
+        ("MaxProfit","max_profit_pct",11),("MaxDD","max_drawdown_pct",11),
+        ("Regime","market_regime",14),("News","news_sentiment",12),
+    ]
+    for c,(h,_,w) in enumerate(scols):
+        ws8.set_column(c,c,w); ws8.write(2,c,h,hdr)
+
+    if scalp_log:
+        for r, row in enumerate(reversed(scalp_log[-300:]), start=3):
+            rf = rfmt(row.get("status","-"))
+            allowed_f = grn if row.get("trade_allowed") == "YES" else red
+            for c,(_,col,_) in enumerate(scols):
+                val = row.get(col,"")
+                if val is None: val = "-"
+                use_f = allowed_f if col == "trade_allowed" else rf
+                ws8.write(r, c, val, use_f)
+    else:
+        ws8.write(3, 0, "No scalp signals yet — scanner populates automatically", ylw)
+
+    # ── Sheet 9: Scalp Blocked ────────────────────────────────────────
+    ws9 = wb.add_worksheet("⚡🚫 Scalp Blocked"); ws9.set_tab_color("#FF6B6B"); ws9.freeze_panes(3,0)
+    ws9.write(0, 0, f"Scalp Blocked Signals — What Was Rejected & Why  ({now_str})", title)
+
+    sbcols = [
+        ("Date","date",10),("Time","time_utc",8),("Symbol","symbol",10),
+        ("Signal","signal",7),("Grade","grade",7),("Blocked By","blocked_by",14),
+        ("Conf","confidence",9),("Score","score",8),("ADX","adx",7),("Vol","vol_ratio",7),
+        ("1m","tf_1m",6),("5m","tf_5m",6),("15m","tf_15m",6),
+        ("Entry","entry_price",13),("SL","stop_loss",13),("TP","take_profit",13),
+        ("MaxProfit","max_profit_pct",11),("MaxAdverse","max_drawdown_pct",11),
+        ("Would've Won?","would_have_won",14),
+        ("Reasons","blocked_reasons",50),
+    ]
+    for c,(h,_,w) in enumerate(sbcols):
+        ws9.set_column(c,c,w); ws9.write(2,c,h,hdr)
+
+    if scalp_blocked:
+        for r, row in enumerate(reversed(scalp_blocked[-200:]), start=3):
+            wwon = row.get("would_have_won")
+            rf2  = loss_f if wwon is True else (win_f if wwon is False else open_f)
+            for c,(_,col,_) in enumerate(sbcols):
+                val = row.get(col,"")
+                if isinstance(val, list): val = " | ".join(str(v) for v in val)
+                if val is None: val = "-"
+                if col == "would_have_won":
+                    val = "✅ YES" if wwon is True else ("❌ NO" if wwon is False else "⏳")
+                ws9.write(r, c, val, rf2)
+    else:
+        ws9.write(3, 0, "No scalp blocked signals yet", ylw)
+
+    # ── Sheet 10: Scalp Stats ─────────────────────────────────────────
+    ws10 = wb.add_worksheet("⚡📊 Scalp Stats"); ws10.set_tab_color("#58A6FF")
+    ws10.write(0, 0, f"Scalp Performance Summary  ({now_str})", title)
+    ws10.set_column("A:A", 28); ws10.set_column("B:B", 16)
+
+    scalp_closed  = [s for s in scalp_log if s.get("status") == "CLOSED"]
+    scalp_wins    = [s for s in scalp_closed if s.get("outcome") == "WIN"]
+    scalp_losses  = [s for s in scalp_closed if s.get("outcome") == "LOSS"]
+    scalp_pnls    = [s["pnl_pct"] for s in scalp_closed if s.get("pnl_pct") is not None]
+    scalp_wr      = round(len(scalp_wins)/max(len(scalp_wins)+len(scalp_losses),1)*100,1)
+
+    scalp_stats = [
+        ("── SCALP OVERVIEW ──────────────────", ""),
+        ("Total Logged",       len(scalp_log)),
+        ("Open",               sum(1 for s in scalp_log if s.get("status")=="OPEN")),
+        ("Closed",             len(scalp_closed)),
+        ("Wins",               len(scalp_wins)),
+        ("Losses",             len(scalp_losses)),
+        ("Win Rate",           f"{scalp_wr}%"),
+        ("Total PnL",          f"{round(sum(scalp_pnls),2):+.2f}%" if scalp_pnls else "0%"),
+        ("Total Blocked",      len(scalp_blocked)),
+        ("", ""),
+        ("── SCALP FILTER SETTINGS ──────────", ""),
+        ("Min Confidence",     f"{SCALP_MIN_CONFIDENCE}%"),
+        ("Min Score",          f"{SCALP_MIN_SCORE}/16"),
+        ("Min Volume",         f"{SCALP_MIN_VOL_RATIO}x"),
+        ("Min ADX",            f"{SCALP_ADX_MIN}"),
+        ("TF Alignment",       "All 3 (1m+5m+15m)"),
+        ("SL Multiplier",      "ATR × 1.0"),
+        ("TP Multiplier",      "ATR × 2.0"),
+        ("R:R Target",         "1:2"),
+        ("Expiry",             "4 hours"),
+        ("", ""),
+        ("── VS SWING ───────────────────────", ""),
+        ("Swing Min Confidence", f"{MIN_CONFIDENCE}%"),
+        ("Swing Min Score",      f"{MIN_SCORE}/16"),
+        ("Swing Min Volume",     f"{MIN_VOL_RATIO}x"),
+        ("Swing Min ADX",        f"{ADX_MIN}"),
+        ("Swing TF",             "15m+1h+4h"),
+        ("Swing TP Multiplier",  "ATR × 4.0"),
+        ("Swing Expiry",         "24 hours"),
+    ]
+    for r,(lbl,val) in enumerate(scalp_stats, start=2):
+        sec = lbl.startswith("──")
+        lf  = subhdr if sec else neu
+        ws10.write(r, 0, lbl, lf)
+        if val != "": ws10.write(r, 1, str(val), neu)
+
     wb.close()
     buf.seek(0)
     return buf.read()
@@ -1296,6 +1739,7 @@ PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 async def background_scanner():
     await asyncio.sleep(10)
     while True:
+        # ── Swing scan ────────────────────────────────────────────────
         for symbol in PAIRS:
             try:
                 sig = compute_signal(symbol)
@@ -1305,7 +1749,6 @@ async def background_scanner():
                 regime_blocked = sig.get("regime_blocked", False)
                 bias_blocked   = sig.get("bias_blocked", False)
 
-                # Case 1 — signal passed all upstream gates, now check hard filters
                 if signal != "HOLD":
                     grade = grade_signal(sig)
                     passed, reasons = passes_filters_detail(sig)
@@ -1314,11 +1757,7 @@ async def background_scanner():
                     else:
                         log_blocked_signal(sig, reasons)
                         log_signal_entry(sig, force_grade=grade)
-
-                # Case 2 — signal was blocked upstream (news/regime/bias)
-                # pre_block_signal tells us what direction it would have been
                 elif pre_block != "HOLD":
-                    # Build a pseudo-sig with the original direction for logging
                     pseudo_sig = {**sig, "signal": pre_block}
                     grade = grade_signal(pseudo_sig)
                     reasons = []
@@ -1331,14 +1770,38 @@ async def background_scanner():
                     if reasons:
                         log_blocked_signal(pseudo_sig, reasons)
                         log_signal_entry(pseudo_sig, force_grade=grade)
-
             except Exception as e:
-                print(f"[Scanner] {symbol} error: {e}")
+                print(f"[Swing Scanner] {symbol} error: {e}")
             await asyncio.sleep(3)
+
+        # ── Scalp scan ────────────────────────────────────────────────
+        for symbol in PAIRS:
+            try:
+                scalp_sig  = compute_scalp_signal(symbol)
+                raw_signal = scalp_sig.get("signal", "HOLD")
+                pre_block  = scalp_sig.get("pre_block_signal", "HOLD")
+
+                if raw_signal != "HOLD":
+                    passed, reasons = passes_scalp_filters(scalp_sig)
+                    log_scalp_signal(scalp_sig, passed, reasons)
+                elif pre_block != "HOLD":
+                    # Upstream blocked (news/regime) — log as blocked scalp
+                    reasons = []
+                    if scalp_sig.get("news_blocked"):
+                        reasons.append(f"News block: {scalp_sig.get('news_risk_level','?')}")
+                    if scalp_sig.get("regime_blocked"):
+                        reasons.append("Market regime blocked")
+                    if reasons:
+                        pseudo = {**scalp_sig, "signal": pre_block}
+                        log_scalp_signal(pseudo, False, reasons)
+            except Exception as e:
+                print(f"[Scalp Scanner] {symbol} error: {e}")
+            await asyncio.sleep(2)
 
         try:
             update_signal_outcomes()
             update_blocked_outcomes()
+            update_scalp_outcomes()
         except Exception as e:
             print(f"[Outcome updater] {e}")
         await asyncio.sleep(300)
@@ -1378,7 +1841,76 @@ def get_signal(symbol: str = "BTCUSDT"):
         import traceback
         return {"error": repr(e), "trace": traceback.format_exc()}
 
-@app.get("/scan/all")
+
+@app.get("/scalp/signal/{symbol}")
+def get_scalp_signal(symbol: str = "BTCUSDT"):
+    try:
+        return compute_scalp_signal(symbol)
+    except Exception as e:
+        import traceback
+        return {"error": repr(e), "trace": traceback.format_exc()}
+
+
+@app.get("/scalp/log")
+def get_scalp_log(limit: int = 50):
+    update_scalp_outcomes()
+    return {"total": len(scalp_log), "signals": scalp_log[-limit:]}
+
+
+@app.get("/scalp/blocked")
+def get_scalp_blocked(limit: int = 50):
+    return {"total": len(scalp_blocked), "signals": scalp_blocked[-limit:]}
+
+
+@app.get("/scalp/stats")
+def get_scalp_stats():
+    update_scalp_outcomes()
+    closed  = [s for s in scalp_log if s.get("status") == "CLOSED"]
+    wins    = [s for s in closed if s.get("outcome") == "WIN"]
+    losses  = [s for s in closed if s.get("outcome") == "LOSS"]
+    pnls    = [s["pnl_pct"] for s in closed if s.get("pnl_pct") is not None]
+    wr      = round(len(wins) / max(len(wins)+len(losses), 1) * 100, 1)
+    blocked_total = len(scalp_blocked)
+    by_filter = {}
+    for f in ["confidence","score","volume","adx","tf_alignment","news","market_regime"]:
+        bf = [b for b in scalp_blocked if b.get("blocked_by") == f]
+        if bf: by_filter[f] = len(bf)
+    return {
+        "mode":           "SCALP",
+        "total_logged":   len(scalp_log),
+        "open":           sum(1 for s in scalp_log if s.get("status") == "OPEN"),
+        "closed":         len(closed),
+        "wins":           len(wins),
+        "losses":         len(losses),
+        "win_rate":       f"{wr}%",
+        "total_pnl":      f"{round(sum(pnls), 2):+.2f}%" if pnls else "0%",
+        "total_blocked":  blocked_total,
+        "blocked_by_filter": by_filter,
+        "last_updated":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+@app.get("/scalp/scan")
+def scalp_scan_all():
+    results = []
+    for symbol in PAIRS:
+        try:
+            sig = compute_scalp_signal(symbol)
+            results.append({
+                "symbol":     symbol,
+                "signal":     sig["signal"],
+                "confidence": sig["confidence"],
+                "score":      sig["score"],
+                "adx":        sig.get("adx"),
+                "vol_ratio":  sig.get("vol_ratio"),
+                "timeframes": sig.get("timeframes"),
+                "risk_reward": sig.get("risk_reward"),
+            })
+        except Exception as e:
+            results.append({"symbol": symbol, "error": str(e)})
+    return {"mode": "SCALP", "pairs": results}
+
+
 def scan_all_pairs():
     results = []
     for symbol in PAIRS:
