@@ -2047,7 +2047,7 @@ def _grade_stats(signals: list, grade: str) -> dict:
 @app.get("/journal/grade-stats")
 def journal_grade_stats():
     """
-    Returns A/B/C grade performance comparison.
+    Returns A/B/C grade performance comparison for SWING signals.
     After 50-100 signals this tells you which filter tier is most profitable.
     """
     update_signal_outcomes()
@@ -2056,6 +2056,31 @@ def journal_grade_stats():
         "total_signals":     len(directional),
         "summary":           (
             f"{len(directional)} directional signals logged — "
+            f"{sum(1 for s in directional if s.get('grade')=='A')} A-grade, "
+            f"{sum(1 for s in directional if s.get('grade')=='B')} B-grade, "
+            f"{sum(1 for s in directional if s.get('grade')=='C')} C-grade"
+        ),
+        "grades": {
+            "A": _grade_stats(directional, "A"),
+            "B": _grade_stats(directional, "B"),
+            "C": _grade_stats(directional, "C"),
+        },
+        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+@app.get("/scalp/grade-stats")
+def scalp_grade_stats():
+    """
+    Returns A/B/C grade performance comparison for SCALP signals only.
+    Separate from swing — scalp uses 1m+5m+15m, different thresholds.
+    """
+    update_scalp_outcomes()
+    directional = [s for s in scalp_log if s.get("signal") in ("BUY", "SELL")]
+    return {
+        "total_signals":     len(directional),
+        "summary":           (
+            f"{len(directional)} scalp signals logged — "
             f"{sum(1 for s in directional if s.get('grade')=='A')} A-grade, "
             f"{sum(1 for s in directional if s.get('grade')=='B')} B-grade, "
             f"{sum(1 for s in directional if s.get('grade')=='C')} C-grade"
