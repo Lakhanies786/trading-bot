@@ -365,12 +365,12 @@ def compute_signal(symbol: str) -> dict:
 
     # ── Phase 2 Breakout: promote to signal if confirmed ─────────────
     # If a confirmed breakout exists, treat it as a strong BUY/SELL
-    # regardless of whether the normal signal agrees (it often lags)
+    # Does NOT override news blocks — too risky during high-impact events
     breakout_promotes = False
     if breakout_info["phase"] == 2:
         bo_dir = "BUY" if breakout_info["direction"] == "UP" else "SELL"
-        # Only promote if NOT blocked by regime or bias
-        if not regime_blocked and not bias_blocked:
+        # Only promote if NOT blocked by regime, bias, OR news
+        if not regime_blocked and not bias_blocked and not news_blocked:
             if final_signal == "HOLD" or final_signal == bo_dir:
                 final_signal    = bo_dir
                 breakout_promotes = True
@@ -407,7 +407,7 @@ def compute_signal(symbol: str) -> dict:
     result = {
         "symbol":             symbol,
         "signal":             final_signal,
-        "pre_block_signal":   main.get("signal", "HOLD"),  # original direction before any block
+        "pre_block_signal":   raw_signal,   # direction before ANY block (regime/bias/news)
         "news_blocked":       news_blocked,
         "regime_blocked":     regime_blocked,
         "bias_blocked":       bias_blocked,
@@ -512,24 +512,27 @@ def compute_scalp_signal(symbol: str) -> dict:
     All 3 timeframes must agree for a valid scalp signal.
     """
     from strategy.indicators import prepare_dataframe, add_indicators, generate_signal
-    from strategy.indicators import detect_market_regime
+    from strategy.indicators import detect_market_regime, detect_daily_bias
     from strategy.orderbook  import analyze_orderbook
 
     spot = get_spot()
 
-    klines_1m  = spot.get_klines(symbol, interval="1m",  limit=100)
-    klines_5m  = spot.get_klines(symbol, interval="5m",  limit=100)
-    klines_15m = spot.get_klines(symbol, interval="15m", limit=100)
+    klines_1m  = spot.get_klines(symbol, interval="1m",  limit=150)
+    klines_5m  = spot.get_klines(symbol, interval="5m",  limit=150)
+    klines_15m = spot.get_klines(symbol, interval="15m", limit=150)
+    klines_1d  = spot.get_klines(symbol, interval="1d",  limit=50)
 
     df_1m  = add_indicators(prepare_dataframe(klines_1m))
     df_5m  = add_indicators(prepare_dataframe(klines_5m))
     df_15m = add_indicators(prepare_dataframe(klines_15m))
+    df_1d  =                prepare_dataframe(klines_1d)
 
     sig_1m  = generate_signal(df_1m)
     sig_5m  = generate_signal(df_5m)
     sig_15m = generate_signal(df_15m)
 
     regime_info = detect_market_regime(df_5m)
+    bias_info   = detect_daily_bias(df_1d)
 
     orderbook   = spot.get_orderbook(symbol, limit=50)
     ob_analysis = analyze_orderbook(orderbook, sig_5m["price"])
@@ -549,17 +552,30 @@ def compute_scalp_signal(symbol: str) -> dict:
         raw_signal    = "HOLD"
         mtf_agreement = "⏳ Scalp TF disagree — wait"
 
-    final_signal = raw_signal
+    # Stabilise scalp signal — require 2 consecutive agreements to fire
+    # Uses separate state key so scalp doesn't interfere with swing state
+    final_signal = stabilize_signal(f"SCALP_{symbol}", raw_signal)
 
-    # Regime gate — block ranging markets for scalping
+    # ── Regime gate ───────────────────────────────────────────────────
     regime_blocked = False
     if not regime_info["tradeable"] and final_signal != "HOLD":
         regime_blocked = True
         final_signal   = "HOLD"
 
-    # News gate
+    # ── Daily Bias gate ───────────────────────────────────────────────
+    bias_blocked = False
+    if not regime_blocked and final_signal != "HOLD":
+        bias = bias_info["bias"]
+        if bias == "BULLISH" and final_signal == "SELL":
+            bias_blocked = True
+            final_signal = "HOLD"
+        elif bias == "BEARISH" and final_signal == "BUY":
+            bias_blocked = True
+            final_signal = "HOLD"
+
+    # ── News gate ─────────────────────────────────────────────────────
     news_blocked = False
-    if NEWS_BLOCK_ENABLED and not regime_blocked:
+    if NEWS_BLOCK_ENABLED and not regime_blocked and not bias_blocked:
         from news_filter import check_news_safety
         news_info = check_news_safety(symbol)
         if not news_info["safe"]:
@@ -567,7 +583,7 @@ def compute_scalp_signal(symbol: str) -> dict:
             final_signal = "HOLD"
     else:
         news_info = {"safe": True, "risk_level": "CLEAR", "reason": "",
-                     "sentiment": "UNKNOWN", "news_score": 0}
+                     "sentiment": "UNKNOWN", "news_score": 0, "events": []}
 
     # SL/TP — tighter than swing: ATR×1.0 stop, ATR×2.0 target (1:2 R:R)
     main    = sig_5m
@@ -590,11 +606,6 @@ def compute_scalp_signal(symbol: str) -> dict:
         reward = abs(take_profit - price)
         risk_reward = f"1:{round(reward/risk, 1)}" if risk > 0 else "1:2"
 
-    conf_pct = main.get("confidence", "0%")
-    conf_num = int(str(conf_pct).replace("%",""))
-    score_str = main.get("score", "0/16")
-    score_num = int(score_str.split("/")[0]) if "/" in score_str else 0
-
     result = {
         "mode":               "SCALP",
         "symbol":             symbol,
@@ -602,9 +613,9 @@ def compute_scalp_signal(symbol: str) -> dict:
         "pre_block_signal":   raw_signal,
         "news_blocked":       news_blocked,
         "regime_blocked":     regime_blocked,
-        "bias_blocked":       False,
-        "confidence":         conf_pct,
-        "score":              score_str,
+        "bias_blocked":       bias_blocked,
+        "confidence":         main.get("confidence", "0%"),
+        "score":              main.get("score", "0/16"),
         "adx":                round(main.get("adx") or 0, 2),
         "vol_ratio":          round(main.get("vol_ratio") or 0, 2),
         "rsi":                round(main.get("rsi") or 0, 2),
@@ -623,6 +634,7 @@ def compute_scalp_signal(symbol: str) -> dict:
         "ob_signal":          ob_signal,
         "ob_reasons":         ob_analysis.get("ob_reasons", []),
         "market_regime":      regime_info.get("regime", "UNKNOWN"),
+        "daily_bias":         bias_info.get("bias", "NEUTRAL"),
         "news_sentiment":     news_info.get("sentiment", "UNKNOWN"),
         "news_score":         news_info.get("news_score", 0),
         "news_risk_level":    news_info.get("risk_level", "CLEAR"),
