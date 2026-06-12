@@ -11,21 +11,25 @@ from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="MEXC Trading Bot", version="8.0.0")
 
-# ── In-memory signal log (persisted to signal_log.json) ──────────────
-SIGNAL_LOG_FILE   = "signal_log.json"
-BLOCKED_LOG_FILE  = "blocked_signals.json"   # NEW — every rejected signal logged here
+# ── Log file paths — always relative to THIS file, never CWD ──────────
+# This prevents logs from resetting when server is restarted from a
+# different working directory. Logs stay in the same folder as main.py.
+_BASE_DIR = Path(__file__).parent.resolve()
+
+SIGNAL_LOG_FILE      = str(_BASE_DIR / "signal_log.json")
+BLOCKED_LOG_FILE     = str(_BASE_DIR / "blocked_signals.json")
+SCALP_LOG_FILE       = str(_BASE_DIR / "scalp_signal_log.json")
+SCALP_BLOCKED_FILE   = str(_BASE_DIR / "scalp_blocked_log.json")
 MIN_CONFIDENCE   = 50      # Lowered from 70 — testing phase (was filtering too aggressively)
 MIN_SCORE        = 10      # Lowered from 11 — testing phase
 MIN_VOL_RATIO    = 0.8     # Lowered from 1.0 — testing phase
 ADX_MIN          = 20      # Lowered from 25 — most ETH/BTC signals were 20-24 and got rejected
 
 # ── Scalping Filter Constants (stricter — higher accuracy needed) ──────
-SCALP_MIN_CONFIDENCE = 65   # higher bar — scalp signals must be high conviction
-SCALP_MIN_SCORE      = 12   # stricter score
-SCALP_MIN_VOL_RATIO  = 1.2  # volume must confirm move
+SCALP_MIN_CONFIDENCE = 55   # lowered from 65 — testing phase (collecting data)
+SCALP_MIN_SCORE      = 10   # lowered from 12 — testing phase
+SCALP_MIN_VOL_RATIO  = 0.6  # lowered from 1.2 — scalp signals have naturally lower volume on 5m
 SCALP_ADX_MIN        = 22   # trend must be clear
-SCALP_LOG_FILE       = "scalp_signal_log.json"
-SCALP_BLOCKED_FILE   = "scalp_blocked_log.json"
 TRADE_HRS_UTC    = (8, 17) # UTC trading hours
 REQUIRE_4H       = True
 MAX_SIGNAL_AGE   = 24
@@ -866,8 +870,13 @@ def passes_scalp_filters(sig: dict) -> tuple[bool, list[str]]:
     return len(reasons) == 0, reasons
 
 
-def log_scalp_signal(sig: dict, passed: bool, reasons: list[str]):
-    """Log scalp signal to scalp_log (if passed) or scalp_blocked (if failed)."""
+def log_scalp_signal(sig: dict, passed: bool, reasons: list[str], force_grade: str = None):
+    """
+    Log scalp signal to:
+    - scalp_log ALWAYS (for grade journal — same as swing approach)
+    - scalp_blocked additionally if failed (for blocked signal tracking)
+    force_grade: pre-computed grade to avoid calling grade_signal twice.
+    """
     global scalp_log, scalp_blocked
     signal = sig.get("signal") or sig.get("pre_block_signal", "HOLD")
     if signal == "HOLD":
@@ -883,7 +892,7 @@ def log_scalp_signal(sig: dict, passed: bool, reasons: list[str]):
         "time_utc":      now.strftime("%H:%M"),
         "symbol":        sig.get("symbol", ""),
         "signal":        signal,
-        "grade":         grade_signal({**sig, "signal": signal}),
+        "grade":         force_grade or grade_signal({**sig, "signal": signal}),
         "trade_allowed": "YES" if passed else "NO",
         "blocked_by":    _primary_blocker(reasons) if not passed else "none",
         "blocked_reasons": reasons if not passed else [],
@@ -901,6 +910,8 @@ def log_scalp_signal(sig: dict, passed: bool, reasons: list[str]):
         "stop_loss":     round(sig.get("stop_loss") or 0, 6),
         "take_profit":   round(sig.get("take_profit") or 0, 6),
         "risk_reward":   sig.get("risk_reward", "N/A"),
+        "nearest_support":    round(sig.get("nearest_support") or 0, 6),
+        "nearest_resistance": round(sig.get("nearest_resistance") or 0, 6),
         # Outcome tracking
         "status":        "OPEN",
         "outcome":       "-",
@@ -923,20 +934,23 @@ def log_scalp_signal(sig: dict, passed: bool, reasons: list[str]):
 
     # Deduplicate — skip same symbol+direction in last 15 min for scalp
     fifteen_ago = (now - timedelta(minutes=15)).isoformat()
-    target_log  = scalp_log if passed else scalp_blocked
 
-    for s in target_log[-100:]:
+    for s in scalp_log[-100:]:
         if (s["symbol"] == entry["symbol"] and s["signal"] == signal
                 and s["logged_at"] > fifteen_ago):
             return
 
-    target_log.append(entry)
-    if len(target_log) > 500:
-        target_log[:] = target_log[-500:]
+    # Always log to scalp_log for grade journal (regardless of passed/failed)
+    scalp_log.append(entry)
+    if len(scalp_log) > 500:
+        scalp_log[:] = scalp_log[-500:]
+    save_scalp_log(scalp_log)
 
-    if passed:
-        save_scalp_log(scalp_log)
-    else:
+    # Additionally log to scalp_blocked for blocked signal tracking
+    if not passed:
+        scalp_blocked.append(entry)
+        if len(scalp_blocked) > 500:
+            scalp_blocked[:] = scalp_blocked[-500:]
         save_scalp_blocked(scalp_blocked)
 
 
@@ -1808,18 +1822,28 @@ async def background_scanner():
                 pre_block  = scalp_sig.get("pre_block_signal", "HOLD")
 
                 if raw_signal != "HOLD":
+                    # Grade the signal using same A/B/C logic as swing
+                    grade = grade_signal(scalp_sig)
                     passed, reasons = passes_scalp_filters(scalp_sig)
-                    log_scalp_signal(scalp_sig, passed, reasons)
+                    # Log ALL directional signals to scalp_log for grade journal
+                    # (same approach as swing — blocked signals still get logged
+                    #  so A/B/C grade journal has data to compare)
+                    log_scalp_signal(scalp_sig, passed, reasons, force_grade=grade)
+
                 elif pre_block != "HOLD":
-                    # Upstream blocked (news/regime) — log as blocked scalp
+                    # Upstream blocked (news/regime/S/R) — log as blocked scalp
                     reasons = []
                     if scalp_sig.get("news_blocked"):
                         reasons.append(f"News block: {scalp_sig.get('news_risk_level','?')}")
                     if scalp_sig.get("regime_blocked"):
                         reasons.append("Market regime blocked")
+                    if scalp_sig.get("sr_blocked"):
+                        reasons.append("S/R block: price too close to S/R level")
                     if reasons:
                         pseudo = {**scalp_sig, "signal": pre_block}
-                        log_scalp_signal(pseudo, False, reasons)
+                        grade  = grade_signal(pseudo)
+                        log_scalp_signal(pseudo, False, reasons, force_grade=grade)
+
             except Exception as e:
                 print(f"[Scalp Scanner] {symbol} error: {e}")
             await asyncio.sleep(2)
