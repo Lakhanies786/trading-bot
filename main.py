@@ -839,7 +839,11 @@ def _primary_blocker(reasons: list[str]) -> str:
 
 
 def passes_scalp_filters(sig: dict) -> tuple[bool, list[str]]:
-    """Stricter filter set for scalp signals."""
+    """
+    Filter set for scalp signals.
+    Requires 2/3 TF agreement (not all 3) — 1m is too noisy to require all 3.
+    All other hard blocks still apply.
+    """
     if sig.get("signal", "HOLD") == "HOLD":
         return False, ["Signal is HOLD"]
 
@@ -860,12 +864,14 @@ def passes_scalp_filters(sig: dict) -> tuple[bool, list[str]]:
         reasons.append(f"Volume {vol:.2f}x < {SCALP_MIN_VOL_RATIO}x scalp minimum")
     if adx       < SCALP_ADX_MIN:
         reasons.append(f"ADX {adx:.1f} < {SCALP_ADX_MIN} scalp minimum")
-    if tf_vals.count(signal) < 3:
-        reasons.append(f"Only {tf_vals.count(signal)}/3 scalp TF agree (need all 3)")
+    if tf_vals.count(signal) < 2:                          # relaxed: 2/3 TF (not all 3)
+        reasons.append(f"Only {tf_vals.count(signal)}/3 scalp TF agree (need at least 2)")
     if sig.get("news_blocked"):
         reasons.append(f"News blocked: {sig.get('news_risk_level','?')}")
     if sig.get("regime_blocked"):
         reasons.append(f"Market regime blocked")
+    if sig.get("sr_blocked"):
+        reasons.append(f"S/R block: price too close to S/R level (scalp threshold 0.3%)")
 
     return len(reasons) == 0, reasons
 

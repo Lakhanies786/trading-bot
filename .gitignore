@@ -2,3 +2,7 @@ venv/
 .env
 _pycache_/
 *.pyc
+signal_log.json
+scalp_signal_log.json
+scalp_blocked_log.json
+blocked_signals.json
